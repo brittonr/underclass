@@ -10,6 +10,7 @@ use underclass::flows::FlowRegistry;
 use underclass::models::{
     Account, AccountStatus, BackendId, ModelInfo, RequestLogEntry, Surface, now_ms,
 };
+use underclass::opencode_go::OpencodeGoBackend;
 use underclass::pool::PoolCore;
 use underclass::provider::BackendMap;
 use underclass::proxy::AppState;
@@ -26,6 +27,79 @@ struct MockState {
     /// Remaining 403 responses to serve per bearer token, modelling a redemption-triggered
     /// credential rejection that a token refresh clears.
     forbidden: std::collections::HashMap<String, u32>,
+}
+
+/// The OpenCode Go gateway. Like the real one it refuses requests without `x-opencode-session`.
+/// `go-quota-*` keys have spent their allowance, so the gateway refuses every paid model and
+/// keeps serving the free one; any other `go-*` key gets an echo of what the gateway received.
+fn mock_opencode_go(
+    state: &Arc<Mutex<MockState>>,
+    bearer: &str,
+    headers: &axum::http::HeaderMap,
+    uri: &axum::http::Uri,
+    body: &str,
+) -> Response {
+    let request: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let model = request
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if !headers.contains_key("x-opencode-session") {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            )],
+            r#"{"type":"error","error":{"type":"MissingSessionID","message":"Request is missing x-opencode-session"}}"#.to_string(),
+        )
+            .into_response();
+    }
+    if bearer.starts_with("go-quota-") && model != "beam-free" {
+        state
+            .lock()
+            .unwrap()
+            .fourtwonined
+            .push_back(bearer.to_string());
+        return axum::response::Response::builder()
+            .status(axum::http::StatusCode::TOO_MANY_REQUESTS)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header(axum::http::header::RETRY_AFTER, "3600")
+            .body(Body::from(
+                r#"{"type":"error","error":{"type":"GoUsageLimitError","message":"Go usage limit exceeded"},"metadata":{"limitName":"weekly"}}"#,
+            ))
+            .unwrap();
+    }
+    state
+        .lock()
+        .unwrap()
+        .served_by
+        .push_back(bearer.to_string());
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+    (
+        axum::http::StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".to_string(),
+        )],
+        serde_json::json!({
+            "account": bearer,
+            "path": uri.path(),
+            "model": model,
+            "session": header("x-opencode-session"),
+            "user_agent": header("user-agent"),
+            "usage": {"prompt_tokens": 11, "completion_tokens": 3},
+        })
+        .to_string(),
+    )
+        .into_response()
 }
 
 async fn mock_responses(
@@ -76,6 +150,10 @@ async fn mock_responses(
             r#"{"error":{"message":"credential rejected"}}"#.to_string(),
         )
             .into_response();
+    }
+
+    if bearer.starts_with("go-") {
+        return mock_opencode_go(&state, &bearer, &headers, &uri, &body);
     }
 
     // A model-scoped refusal applies to one model only, the way Anthropic's weekly
@@ -329,6 +407,7 @@ fn mock_upstream() -> &'static Arc<Mutex<MockState>> {
             std::env::set_var("UNDERCLASS_CODEX_UPSTREAM", format!("http://{addr}"));
             std::env::set_var("UNDERCLASS_COPILOT_UPSTREAM", format!("http://{addr}"));
             std::env::set_var("UNDERCLASS_CLAUDE_UPSTREAM", format!("http://{addr}"));
+            std::env::set_var("UNDERCLASS_OPENCODE_GO_UPSTREAM", format!("http://{addr}"));
         }
         format!("http://{addr}")
     });
@@ -367,6 +446,26 @@ fn copilot_account(id: &str, token: &str) -> Account {
     a
 }
 
+/// An OpenCode Go account as enrollment stores it: the key as an access token that expired at
+/// the epoch, with no refresh token.
+fn opencode_go_account(id: &str, key: &str) -> Account {
+    let mut a = account(id, BackendId::OpencodeGo, key);
+    a.refresh_token = None;
+    a.expires_at = 0;
+    a.account_id = None;
+    a
+}
+
+fn opencode_go_model(upstream: &str, context: i64) -> ModelInfo {
+    ModelInfo {
+        id: underclass::opencode_go::catalog_id(upstream),
+        name: upstream.into(),
+        context,
+        input: context,
+        output: 128_000,
+    }
+}
+
 /// The surfaces the end-to-end app serves.
 fn openai_surfaces() -> std::collections::HashMap<BackendId, Vec<Surface>> {
     std::collections::HashMap::from([
@@ -403,6 +502,10 @@ async fn spawn_app(
     backends.insert(BackendId::Codex, Arc::new(CodexBackend { cooldown_ms }));
     backends.insert(BackendId::Copilot, Arc::new(CopilotBackend { cooldown_ms }));
     backends.insert(BackendId::Claude, Arc::new(ClaudeBackend { cooldown_ms }));
+    backends.insert(
+        BackendId::OpencodeGo,
+        Arc::new(OpencodeGoBackend { cooldown_ms }),
+    );
     let core = PoolCore::new(&store, backend_surfaces(&backends));
     let pool = Arc::new(Mutex::new(core));
     let logs: Arc<Mutex<VecDeque<RequestLogEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -1085,6 +1188,7 @@ async fn e2e_failed_manual_refresh_leaves_account_state_alone() {
     let _mock = mock_upstream();
     let store = Arc::new(Store::in_memory().unwrap());
     store.upsert_account(&copilot_account("acct-copilot", "tok-copilot"));
+    store.upsert_account(&opencode_go_account("acct-opencode-go", "oc_sk_go_secret"));
     // No stored refresh token makes the refresh fail before it reaches any issuer.
     let mut codex = codex_account("acct-codex", "tok-codex");
     codex.refresh_token = None;
@@ -1122,6 +1226,16 @@ async fn e2e_failed_manual_refresh_leaves_account_state_alone() {
     assert_eq!(body["error"], "not_refreshable");
     assert_eq!(
         store.get_account("acct-copilot").unwrap().status,
+        AccountStatus::AuthError
+    );
+
+    // Nor is an OpenCode Go key: a no-op "refresh" must not readmit a revoked key.
+    store.update_account_status("acct-opencode-go", AccountStatus::AuthError, 0);
+    let (status, body) = refresh("acct-opencode-go").await;
+    assert_eq!(status, 409);
+    assert_eq!(body["error"], "not_refreshable");
+    assert_eq!(
+        store.get_account("acct-opencode-go").unwrap().status,
         AccountStatus::AuthError
     );
 
@@ -1519,4 +1633,178 @@ async fn e2e_anthropic_messages_alias_serves_the_same_surface() {
         .iter()
         .any(|token| token == "claude-alias-token");
     assert!(served, "the alias reached the upstream");
+}
+
+/// OpenCode Go models are addressed by their namespaced catalog id. They reach the gateway's
+/// OpenAI API under their own id, with the pooled key, underclass's user agent and the session
+/// header, and never take over a Codex model that shares their upstream id.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_opencode_go_serves_its_namespaced_models() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.upsert_account(&codex_account(
+        "go-namespace-codex",
+        "tok-go-namespace-codex",
+    ));
+    store.upsert_account(&opencode_go_account("go-namespace-go", "go-key-namespace"));
+    store.set_catalog(
+        BackendId::Codex,
+        &[ModelInfo {
+            context: 272_000,
+            ..model("gpt-6-luna")
+        }],
+    );
+    store.set_catalog(
+        BackendId::OpencodeGo,
+        &[
+            opencode_go_model("kimi-k3", 1_048_576),
+            opencode_go_model("gpt-6-luna", 1_050_000),
+        ],
+    );
+    let (base, _logs) = spawn_app(store.clone(), 60_000).await;
+    let client = reqwest::Client::new();
+
+    let go: serde_json::Value = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key")
+        .json(&serde_json::json!({
+            "model": "opencode-go/kimi-k3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "prompt_cache_key": "sess-go"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(go["account"], "go-key-namespace");
+    assert_eq!(go["path"], "/openai/v1/chat/completions");
+    assert_eq!(go["model"], "kimi-k3");
+    assert_eq!(go["session"], "sess-go");
+    assert!(
+        go["user_agent"]
+            .as_str()
+            .unwrap()
+            .starts_with("underclass/")
+    );
+
+    let codex: serde_json::Value = client
+        .post(format!("{base}/v1/responses"))
+        .header("Authorization", "Bearer test-key")
+        .json(&serde_json::json!({"model": "gpt-6-luna", "input": "hi"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(codex["account"], "tok-go-namespace-codex");
+
+    let models: serde_json::Value = client
+        .get(format!("{base}/v1/models"))
+        .header("Authorization", "Bearer test-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let owner = |id: &str| {
+        models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .map(|m| m["owned_by"].clone())
+    };
+    assert_eq!(
+        owner("gpt-6-luna"),
+        Some(serde_json::json!("underclass-codex"))
+    );
+    assert_eq!(
+        owner("opencode-go/gpt-6-luna"),
+        Some(serde_json::json!("underclass-opencode-go"))
+    );
+    assert_eq!(
+        owner("opencode-go/kimi-k3"),
+        Some(serde_json::json!("underclass-opencode-go"))
+    );
+}
+
+/// A spent OpenCode Go allowance cools only the refused model on that account, until the
+/// gateway's Retry-After. The request fails over to another Go account even when its session is
+/// bound to the spent one, the cooled model is not retried on the spent account, and the spent
+/// account keeps serving the free model. A keyless request still carries a session.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_opencode_go_spent_allowance_cools_only_the_refused_model() {
+    let mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    // Account ids sort so the spent account is selected first.
+    store.upsert_account(&opencode_go_account("go-spent-1", "go-quota-spent"));
+    store.upsert_account(&opencode_go_account("go-spent-2", "go-key-spare"));
+    store.set_catalog(
+        BackendId::OpencodeGo,
+        &[
+            opencode_go_model("kimi-k3", 1_048_576),
+            opencode_go_model("beam-free", 1_048_576),
+        ],
+    );
+    let (base, _logs) = spawn_app(store.clone(), 60_000).await;
+    let client = reqwest::Client::new();
+    let ask = |model: &str, key: Option<&str>| {
+        let mut body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        if let Some(key) = key {
+            body["prompt_cache_key"] = serde_json::Value::String(key.to_string());
+        }
+        client
+            .post(format!("{base}/v1/chat/completions"))
+            .header("Authorization", "Bearer test-key")
+            .json(&body)
+            .send()
+    };
+    let served = |response: reqwest::Response| async move {
+        assert_eq!(response.status(), 200);
+        response.json::<serde_json::Value>().await.unwrap()
+    };
+
+    let first = served(
+        ask("opencode-go/kimi-k3", Some("sess-spent"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(first["account"], "go-key-spare");
+    assert_eq!(first["session"], "sess-spent");
+    let free = served(ask("opencode-go/beam-free", None).await.unwrap()).await;
+    assert_eq!(free["account"], "go-quota-spent");
+    assert!(
+        free["session"].as_str().unwrap().starts_with("underclass-"),
+        "a keyless request carries a derived session"
+    );
+    let again = served(
+        ask("opencode-go/kimi-k3", Some("sess-spent"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(again["account"], "go-key-spare");
+    let refusals = mock
+        .lock()
+        .unwrap()
+        .fourtwonined
+        .iter()
+        .filter(|bearer| *bearer == "go-quota-spent")
+        .count();
+    assert_eq!(
+        refusals, 1,
+        "the cooled model was retried on the spent account"
+    );
+    assert_eq!(
+        store.get_account("go-spent-1").unwrap().status,
+        AccountStatus::Healthy
+    );
 }

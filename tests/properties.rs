@@ -1,7 +1,8 @@
 use hegel::TestCase;
 use hegel::generators as gs;
 use std::collections::HashMap;
-use underclass::models::{Account, AccountStatus, BackendId, Outcome, Surface};
+use underclass::models::{Account, AccountStatus, BackendId, ModelInfo, Outcome, Surface};
+use underclass::opencode_go::{catalog_id, merge_catalog, upstream_model};
 use underclass::pool::{PoolCore, SelectError};
 use underclass::resets::{
     Candidate, RateLimit, Window, blocked_cooling_deadline, choose_candidate, natural_recovery_ms,
@@ -367,7 +368,7 @@ fn test_plan_gate_settles_and_respects_operator_disables(tc: TestCase) {
 fn test_manual_refresh_only_recovers_auth_errors(tc: TestCase) {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use underclass::models::FREE_PLAN_REASON;
-    let backends = [BackendId::Codex, BackendId::Copilot, BackendId::Claude];
+    let backends = BackendId::all();
     let statuses = [
         AccountStatus::Healthy,
         AccountStatus::Cooling,
@@ -1076,8 +1077,8 @@ fn test_surface_partition_never_crosses_protocols(tc: TestCase) {
     }
 }
 
-/// A model-scoped cooldown blocks that model on the account and leaves the account's other
-/// models eligible, and it expires on its own.
+/// A model-scoped cooldown blocks that model on the account, including for a sticky session
+/// bound to it, leaves the account's other models eligible, and expires on its own.
 #[hegel::test]
 fn test_model_cooldown_scopes_one_model(tc: TestCase) {
     let now: i64 = tc.draw(gs::integers::<i64>().min_value(0).max_value(1_000_000));
@@ -1113,4 +1114,76 @@ fn test_model_cooldown_scopes_one_model(tc: TestCase) {
         .is_ok(),
         "the cooldown expires on its own"
     );
+
+    // A session bound to the account rebinds for the cooled model.
+    core.insert_account(account("claude-b", BackendId::Claude));
+    let bound = core
+        .select(
+            now + window + 1,
+            Some("session"),
+            "claude-sonnet-5-5",
+            Surface::Anthropic,
+        )
+        .unwrap();
+    let other = if bound.account_id == "claude-a" {
+        "claude-b"
+    } else {
+        "claude-a"
+    };
+    core.report_model_quota(&bound.account_id, "claude-opus-5-5", now + 2 * window + 2);
+    let cooled = core
+        .select(
+            now + window + 1,
+            Some("session"),
+            "claude-opus-5-5",
+            Surface::Anthropic,
+        )
+        .unwrap();
+    assert_eq!(
+        cooled.account_id, other,
+        "a sticky session never lands on an account cooling for its model"
+    );
+}
+
+#[hegel::test]
+fn test_opencode_go_namespace_strips_exactly_once(tc: TestCase) {
+    let id: String = tc.draw(gs::text());
+    assert_eq!(upstream_model(&catalog_id(&id)), id);
+    if !id.to_ascii_lowercase().starts_with("opencode-go/") {
+        assert_eq!(upstream_model(&id), id, "an unnamespaced id passes through");
+    }
+}
+
+#[hegel::test]
+fn test_opencode_go_catalog_merge_keeps_one_entry_per_live_id(tc: TestCase) {
+    let live: Vec<String> = tc.draw(gs::vecs(gs::text()).max_size(12));
+    let stored_ids: Vec<String> = tc.draw(gs::vecs(gs::text()).max_size(8));
+    let seed_ids: Vec<String> = tc.draw(gs::vecs(gs::text()).max_size(8));
+    let entry = |upstream: &String, context: i64| ModelInfo {
+        id: catalog_id(upstream),
+        name: format!("described {context}"),
+        context,
+        input: context,
+        output: 1,
+    };
+    let stored: Vec<ModelInfo> = stored_ids.iter().map(|id| entry(id, 1)).collect();
+    let seed: Vec<ModelInfo> = seed_ids.iter().map(|id| entry(id, 2)).collect();
+
+    let catalog = merge_catalog(&live, &stored, &seed);
+
+    let mut expected: Vec<String> = live.iter().map(|id| catalog_id(id)).collect();
+    expected.sort();
+    expected.dedup();
+    let ids: Vec<String> = catalog.iter().map(|model| model.id.clone()).collect();
+    assert_eq!(ids, expected, "one entry per live id, sorted");
+    for model in &catalog {
+        let described_by = |ids: &[String]| ids.iter().any(|id| catalog_id(id) == model.id);
+        if described_by(&stored_ids) {
+            assert_eq!(model.context, 1, "stored metadata survives a refresh");
+        } else if described_by(&seed_ids) {
+            assert_eq!(model.context, 2, "the seed describes new models");
+        } else {
+            assert_eq!(model.name, upstream_model(&model.id), "fallback name");
+        }
+    }
 }

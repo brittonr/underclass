@@ -29,10 +29,15 @@ pub fn rotation_due(account: &Account, now_ms: i64) -> bool {
 
 /// Reports whether `force_refresh` actually exchanges `backend`'s credential with its issuer.
 ///
-/// Copilot's GitHub OAuth token never expires and `force_refresh` returns it verbatim, so a
-/// "refresh" there proves nothing about the credential.
+/// Copilot's GitHub OAuth token never expires and an OpenCode Go API key never refreshes:
+/// `force_refresh` returns either verbatim, so a "refresh" there proves nothing about the
+/// credential.
 pub fn refreshes_with_issuer(backend: crate::models::BackendId) -> bool {
-    backend != crate::models::BackendId::Copilot
+    use crate::models::BackendId;
+    match backend {
+        BackendId::Codex | BackendId::Claude => true,
+        BackendId::Copilot | BackendId::OpencodeGo => false,
+    }
 }
 
 /// @cc [owner:ghuntley,label:auth] manual-refresh-recovers-auth-error
@@ -84,15 +89,21 @@ impl TokenManager {
     /// @cc [owner:ghuntley,label:auth] proactive-refresh-margin
     /// `access_token` MUST return the cached Codex access token while it remains valid beyond
     /// `PROACTIVE_REFRESH_MARGIN_MS` from expiry, and MUST force a refresh otherwise. For Copilot
-    /// it MUST return the stored GitHub token directly (it never expires or refreshes). For Claude
-    /// it MUST return the stored OAuth token while it remains valid beyond the same margin, and
-    /// MUST refresh it otherwise.
+    /// it MUST return the stored GitHub token directly (it never expires or refreshes), and for
+    /// OpenCode Go the stored API key. For Claude it MUST return the stored OAuth token while it
+    /// remains valid beyond the same margin, and MUST refresh it otherwise.
     pub async fn access_token(&self, account: &Account) -> Result<String, TokenError> {
         match account.backend {
             crate::models::BackendId::Copilot => account
                 .refresh_token
                 .clone()
                 .ok_or(TokenError::MissingToken),
+            // The key is stored as an access token that expired at the epoch, with no refresh
+            // token: a build without the OpenCode Go backend reads the account as Codex and finds
+            // nothing valid to send or refresh (ADR 0027).
+            crate::models::BackendId::OpencodeGo => {
+                account.access_token.clone().ok_or(TokenError::MissingToken)
+            }
             crate::models::BackendId::Codex => {
                 if let Some(token) = &account.access_token {
                     if account
@@ -135,14 +146,21 @@ impl TokenManager {
             .get_account(account_id)
             .ok_or(TokenError::MissingToken)?;
 
-        let refresh_token = account
-            .refresh_token
-            .clone()
-            .ok_or(TokenError::MissingToken)?;
+        let refresh_token = || {
+            account
+                .refresh_token
+                .clone()
+                .ok_or(TokenError::MissingToken)
+        };
 
         match account.backend {
-            crate::models::BackendId::Copilot => Ok(refresh_token),
+            crate::models::BackendId::Copilot => refresh_token(),
+            // An OpenCode Go key is its own credential: there is nothing to refresh.
+            crate::models::BackendId::OpencodeGo => {
+                account.access_token.clone().ok_or(TokenError::MissingToken)
+            }
             crate::models::BackendId::Codex => {
+                let refresh_token = refresh_token()?;
                 let tokens = crate::codex::refresh(&self.client, &refresh_token)
                     .await
                     .map_err(|e| TokenError::RefreshFailed(e.to_string()))?;
@@ -164,6 +182,7 @@ impl TokenManager {
                 Ok(tokens.access_token)
             }
             crate::models::BackendId::Claude => {
+                let refresh_token = refresh_token()?;
                 let tokens = crate::claude::refresh(&self.client, &refresh_token)
                     .await
                     .map_err(|e| TokenError::RefreshFailed(e.to_string()))?;

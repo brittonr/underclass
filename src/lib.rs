@@ -10,6 +10,7 @@ pub mod jwt;
 pub mod logging;
 pub mod models;
 pub mod monitor;
+pub mod opencode_go;
 pub mod pool;
 pub mod provider;
 pub mod proxy;

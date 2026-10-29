@@ -1,3 +1,4 @@
+use crate::flows::FlowState;
 use crate::models::{AccountStatus, BackendId, RequestLogEntry, now_ms};
 use crate::proxy::AppState;
 use crate::store::UsageQuery;
@@ -185,6 +186,12 @@ pub struct StartFlowBody {
     pub backend: String,
     #[serde(default)]
     pub enterprise_url: Option<String>,
+    /// The Console API key of an OpenCode Go account. Never echoed.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Operator label for an OpenCode Go account.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 pub async fn start_flow(
@@ -223,6 +230,15 @@ pub async fn start_flow(
         )
         .await
         .map_err(|e| e.to_string()),
+        BackendId::OpencodeGo => {
+            return enroll_opencode_go(
+                &state,
+                None,
+                body.api_key.as_deref(),
+                body.label.as_deref(),
+            )
+            .await;
+        }
     };
     match result {
         Ok(flow_id) => {
@@ -235,6 +251,73 @@ pub async fn start_flow(
         )
             .into_response(),
     }
+}
+
+/// @cc [owner:ghuntley,label:security] opencode-go-enrollment-endpoint
+/// Enrolling an OpenCode Go key MUST answer 400 for a missing or unusable key, 404 for a replaced
+/// account that is not an OpenCode Go account, and 502 with OpenCode's own message when the
+/// gateway rejects the key, and MUST NOT echo the key. On success it MUST make the account
+/// routable at once, record its allowance windows, refresh the catalog, and return an authorized
+/// flow.
+async fn enroll_opencode_go(
+    state: &Arc<AppState>,
+    replace_account: Option<&str>,
+    api_key: Option<&str>,
+    label: Option<&str>,
+) -> Response {
+    use crate::opencode_go::AuthError;
+    let Some(api_key) = api_key else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "an OpenCode Go account needs an api_key",
+        )
+            .into_response();
+    };
+    let (account, usage) = match crate::opencode_go::enroll(
+        &state.client,
+        &state.store,
+        replace_account,
+        api_key,
+        label,
+    )
+    .await
+    {
+        Ok(enrolled) => enrolled,
+        Err(e @ AuthError::InvalidKey) => {
+            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
+        Err(e @ AuthError::UnknownAccount) => {
+            return (StatusCode::NOT_FOUND, e.to_string()).into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("OpenCode Go did not accept the key: {e}"),
+            )
+                .into_response();
+        }
+    };
+    state.pool.lock().unwrap().sync_account(account.clone());
+    state
+        .observations
+        .lock()
+        .unwrap()
+        .insert(account.id.clone(), crate::opencode_go::usage_view(&usage));
+    if let Some(key) = account.access_token.as_deref()
+        && let Err(e) =
+            crate::opencode_go::refresh_catalog(&state.client, &state.store, &state.pool, key).await
+    {
+        tracing::warn!(error = %e, "opencode_go.catalog_refresh_failed");
+    }
+    let flow_id = state.flows.create(
+        BackendId::OpencodeGo,
+        FlowState::Authorized {
+            account_id: account.id.clone(),
+        },
+        replace_account.map(str::to_string),
+    );
+    let flow = state.flows.get(&flow_id);
+    Json(json!({ "flow_id": flow_id, "flow": flow })).into_response()
 }
 
 pub async fn flow_status(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
@@ -372,9 +455,18 @@ pub async fn refresh_account(
     .into_response()
 }
 
+#[derive(Deserialize, Default)]
+pub struct ReloginBody {
+    /// The replacement Console API key of an OpenCode Go account. Never echoed.
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+/// The body is optional: only an OpenCode Go account reads it, for its replacement key.
 pub async fn relogin_account(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    body: axum::body::Bytes,
 ) -> Response {
     let Some(account) = state.store.get_account(&id) else {
         return (StatusCode::NOT_FOUND, "unknown account").into_response();
@@ -405,6 +497,11 @@ pub async fn relogin_account(
         )
         .await
         .map_err(|e| e.to_string()),
+        BackendId::OpencodeGo => {
+            let replacement: ReloginBody = serde_json::from_slice(&body).unwrap_or_default();
+            return enroll_opencode_go(&state, Some(&id), replacement.api_key.as_deref(), None)
+                .await;
+        }
     };
     match result {
         Ok(flow_id) => {
@@ -595,4 +692,18 @@ pub async fn refresh_copilot_catalog(State(state): State<Arc<AppState>>) -> Resp
         }
     }
     Json(json!({ "refreshed_accounts": refreshed, "errors": errors })).into_response()
+}
+
+/// Refreshes the OpenCode Go catalog from the gateway's live model list, using the first enabled
+/// account whose key the gateway accepts.
+pub async fn refresh_opencode_go_catalog(State(state): State<Arc<AppState>>) -> Response {
+    let (models, errors) =
+        crate::opencode_go::refresh_catalog_from_pool(&state.client, &state.store, &state.pool)
+            .await;
+    Json(json!({
+        "refreshed_accounts": usize::from(models.is_some()),
+        "models": models.unwrap_or(0),
+        "errors": errors,
+    }))
+    .into_response()
 }

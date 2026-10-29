@@ -54,6 +54,36 @@ pub fn usage_from_dialect(value: &Value, dialect: UsageDialect) -> Option<TokenC
     }
 }
 
+/// @cc [owner:ghuntley,label:accounting] chat-stream-usage
+/// For streamed chat completions, `request_stream_usage` MUST request final usage only when the
+/// client has not supplied `stream_options.include_usage`; explicit client settings MUST be
+/// preserved. It reports whether it changed the body.
+pub fn request_stream_usage(path: &str, body: &mut Value) -> bool {
+    if !path.ends_with("/chat/completions")
+        || body.get("stream").and_then(Value::as_bool) != Some(true)
+    {
+        return false;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return false;
+    };
+    if let Some(options) = obj.get_mut("stream_options") {
+        let Some(options) = options.as_object_mut() else {
+            return false;
+        };
+        if options.contains_key("include_usage") {
+            return false;
+        }
+        options.insert("include_usage".into(), Value::Bool(true));
+    } else {
+        obj.insert(
+            "stream_options".into(),
+            serde_json::json!({"include_usage": true}),
+        );
+    }
+    true
+}
+
 /// How an upstream response body ended, as observed by the proxy while passing it through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

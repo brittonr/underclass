@@ -6,6 +6,9 @@ pub enum BackendId {
     Codex,
     Copilot,
     Claude,
+    /// OpenCode Go subscriptions, authenticated with a Console API key.
+    #[serde(rename = "opencode-go")]
+    OpencodeGo,
 }
 
 impl BackendId {
@@ -14,6 +17,7 @@ impl BackendId {
             BackendId::Codex => "codex",
             BackendId::Copilot => "copilot",
             BackendId::Claude => "claude",
+            BackendId::OpencodeGo => "opencode-go",
         }
     }
 
@@ -22,12 +26,19 @@ impl BackendId {
             "codex" => Some(BackendId::Codex),
             "copilot" => Some(BackendId::Copilot),
             "claude" => Some(BackendId::Claude),
+            "opencode-go" => Some(BackendId::OpencodeGo),
             _ => None,
         }
     }
 
-    pub fn all() -> [BackendId; 3] {
-        [BackendId::Codex, BackendId::Copilot, BackendId::Claude]
+    /// Every backend, in the stable order the unknown-model fallback consults (ADR 0024).
+    pub fn all() -> [BackendId; 4] {
+        [
+            BackendId::Codex,
+            BackendId::Copilot,
+            BackendId::Claude,
+            BackendId::OpencodeGo,
+        ]
     }
 }
 

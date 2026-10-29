@@ -656,8 +656,8 @@ fn quota(account: &MonitorAccount, now_ms: i64) -> String {
     if account.backend == BackendId::Copilot {
         return "unknown".into();
     }
-    if account.backend == BackendId::Claude {
-        return claude_quota(account);
+    if matches!(account.backend, BackendId::Claude | BackendId::OpencodeGo) {
+        return observed_quota(account);
     }
     let Some(snapshot) = &account.quota else {
         return "waiting…".into();
@@ -691,29 +691,41 @@ fn quota(account: &MonitorAccount, now_ms: i64) -> String {
     }
 }
 
-/// The Claude Code subscription windows, as the account's own usage API last reported them.
-fn claude_quota(account: &MonitorAccount) -> String {
-    let Some(observation) = &account.observation else {
+/// The window names an account's usage observation reports, with their column labels: Claude
+/// Code reports the 5-hour and weekly windows, OpenCode Go a monthly allowance as well.
+const OBSERVED_WINDOWS: [(&str, &str); 3] =
+    [("five_hour", "5h"), ("seven_day", "7d"), ("monthly", "mo")];
+
+/// The percent left of each observed window the account's usage API last reported.
+fn observed_remaining(account: &MonitorAccount) -> Option<Vec<(&'static str, f64)>> {
+    let observation = account.observation.as_ref()?;
+    Some(
+        OBSERVED_WINDOWS
+            .into_iter()
+            .filter_map(|(name, label)| {
+                observation
+                    .get(name)
+                    .and_then(|w| w.get("utilization"))
+                    .and_then(|u| u.as_f64())
+                    .map(|utilization| (label, (100.0 - utilization * 100.0).clamp(0.0, 100.0)))
+            })
+            .collect(),
+    )
+}
+
+/// The subscription windows, as the account's own usage API last reported them.
+fn observed_quota(account: &MonitorAccount) -> String {
+    let Some(windows) = observed_remaining(account) else {
         return "waiting…".into();
     };
-    let window = |name: &str| {
-        observation
-            .get(name)
-            .and_then(|w| w.get("utilization"))
-            .and_then(|u| u.as_f64())
-            .map(|utilization| (100.0 - utilization * 100.0).clamp(0.0, 100.0))
-    };
-    let mut windows = Vec::new();
-    if let Some(left) = window("five_hour") {
-        windows.push(format!("5h {left:.0}%"));
-    }
-    if let Some(left) = window("seven_day") {
-        windows.push(format!("7d {left:.0}%"));
-    }
     if windows.is_empty() {
         return "unavailable".into();
     }
-    windows.join(" · ")
+    windows
+        .iter()
+        .map(|(label, left)| format!("{label} {left:.0}%"))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn credits(account: &MonitorAccount) -> String {
@@ -731,20 +743,14 @@ fn credits(account: &MonitorAccount) -> String {
         .map_or("—".into(), |q| q.available_resets.to_string())
 }
 
-/// The Claude Code windows use the same severity bands as the Codex quota.
-fn claude_quota_color(account: &MonitorAccount) -> Color {
-    let Some(observation) = &account.observation else {
+/// The observed windows use the same severity bands as the Codex quota.
+fn observed_quota_color(account: &MonitorAccount) -> Color {
+    let Some(windows) = observed_remaining(account) else {
         return MUTED;
     };
-    let remaining = ["five_hour", "seven_day"]
-        .into_iter()
-        .filter_map(|name| {
-            observation
-                .get(name)
-                .and_then(|w| w.get("utilization"))
-                .and_then(|u| u.as_f64())
-                .map(|utilization| (100.0 - utilization * 100.0).clamp(0.0, 100.0))
-        })
+    let remaining = windows
+        .iter()
+        .map(|(_, left)| *left)
         .fold(100.0f64, f64::min);
     if remaining <= 10.0 {
         RED
@@ -759,8 +765,8 @@ fn claude_quota_color(account: &MonitorAccount) -> Color {
 /// Fresh Codex quota MUST use the least remaining window: green above 30%, amber above 10% through
 /// 30%, red at 10% or less or when exhausted. Missing or stale quota MUST use a muted color.
 fn quota_color(account: &MonitorAccount, now_ms: i64) -> Color {
-    if account.backend == BackendId::Claude {
-        return claude_quota_color(account);
+    if matches!(account.backend, BackendId::Claude | BackendId::OpencodeGo) {
+        return observed_quota_color(account);
     }
     if account.backend != BackendId::Codex {
         return MUTED;
@@ -869,6 +875,45 @@ mod tests {
             ..account
         };
         assert_eq!(quota_color(&exhausted, 1_000), RED);
+    }
+
+    #[test]
+    fn opencode_go_quota_column_includes_the_monthly_allowance() {
+        let account = MonitorAccount {
+            id: "g".into(),
+            label: "opencode-go oc_sk_1a2b3c4d5e6f".into(),
+            backend: BackendId::OpencodeGo,
+            plan: None,
+            status: AccountStatus::Healthy,
+            reset_at: 0,
+            inflight: 0,
+            sticky_sessions: 0,
+            month: Counters::default(),
+            observation: Some(crate::opencode_go::usage_view(
+                &crate::opencode_go::parse_usage(
+                    &serde_json::json!({"usage": {
+                        "rolling": {"status": "ok", "percent": 0, "resetsAt": "2026-10-29T21:30:07Z"},
+                        "weekly": {"status": "ok", "percent": 94, "resetsAt": "2026-11-02T00:00:00Z"},
+                        "monthly": {"status": "rate-limited", "percent": 100, "resetsAt": "2026-11-15T00:09:27Z"}
+                    }}),
+                    0,
+                )
+                .unwrap(),
+            )),
+            quota: None,
+        };
+        assert_eq!(quota(&account, 1_000), "5h 100% · 7d 6% · mo 0%");
+        assert_eq!(quota_color(&account, 1_000), RED);
+        assert_eq!(
+            quota(
+                &MonitorAccount {
+                    observation: None,
+                    ..account
+                },
+                1_000
+            ),
+            "waiting…"
+        );
     }
 
     #[test]

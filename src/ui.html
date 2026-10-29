@@ -55,6 +55,7 @@
       <div class="row">
         <button onclick="startFlow()">Add account</button>
         <button onclick="refreshCopilotCatalog()">Refresh Copilot catalog</button>
+        <button onclick="refreshOpencodeGoCatalog()">Refresh OpenCode Go catalog</button>
       </div>
     </div>
     <table id="accounts">
@@ -137,6 +138,7 @@
       <option value="codex">codex</option>
       <option value="copilot">copilot</option>
       <option value="claude">claude</option>
+      <option value="opencode-go">opencode-go</option>
     </select>
     <label>models (JSON array of {id, name, context, input, output})</label>
     <textarea id="catalogEditor" rows="10"></textarea>
@@ -155,10 +157,17 @@
       <option value="codex">ChatGPT / Codex</option>
       <option value="copilot">GitHub Copilot</option>
       <option value="claude">Claude Code (Anthropic)</option>
+      <option value="opencode-go">OpenCode Go (API key)</option>
     </select>
     <div id="enterpriseWrap" style="display:none">
       <label>GitHub Enterprise URL or domain (blank for github.com)</label>
       <input id="flowEnterprise" placeholder="company.ghe.com">
+    </div>
+    <div id="opencodeGoWrap" style="display:none">
+      <label>OpenCode Console API key</label>
+      <input id="flowApiKey" type="password" autocomplete="off" placeholder="oc_sk_…">
+      <label>label (blank for the key's public id)</label>
+      <input id="flowLabel" placeholder="workspace name">
     </div>
     <div class="row" style="margin-top:16px">
       <button class="primary" onclick="beginFlow()">Continue</button>
@@ -239,6 +248,7 @@ function formatQuota(o) {
   window('5h', o.five_hour);
   window('7d', o.seven_day);
   window('7d fable', o.seven_day_fable);
+  window('mo', o.monthly);
   if (o.reset_credits) parts.push(o.reset_credits + ' reset' + (o.reset_credits > 1 ? 's' : ''));
   if (!parts.length) return o.status || '—';
   return parts.join(' · ');
@@ -262,8 +272,8 @@ async function loadState() {
         <td>${formatCredits(a.usage)}</td>
         <td class="row">
           ${a.status === 'disabled' ? `<button onclick="acct('${a.id}','enable')">Enable</button>` : `<button onclick="acct('${a.id}','disable')">Disable</button>`}
-          ${a.status === 'auth_error' ? `<button onclick="acct('${a.id}','enable')">Enable</button><button class="primary" onclick="relogin('${a.id}')">Re-login</button>` : ''}
-          ${a.backend !== 'copilot' ? `<button onclick="refreshToken('${a.id}')">Refresh token</button>` : ''}
+          ${a.status === 'auth_error' ? `<button onclick="acct('${a.id}','enable')">Enable</button><button class="primary" onclick="relogin('${a.id}','${a.backend}')">Re-login</button>` : ''}
+          ${a.backend !== 'copilot' && a.backend !== 'opencode-go' ? `<button onclick="refreshToken('${a.id}')">Refresh token</button>` : ''}
           ${a.backend === 'codex' && a.usage && a.usage.available_resets > 0 ? `<button onclick="useReset('${a.id}')">Use reset</button>` : ''}
           ${a.backend === 'claude' && a.observation && a.observation.reset_credits > 0 ? `<button onclick="useReset('${a.id}')">Use reset</button>` : ''}
           <button class="danger" onclick="del('${a.id}')">Remove</button>
@@ -451,7 +461,7 @@ function snippet(catalog) {
   return {
     provider: { underclass: {
       npm: '@ai-sdk/openai-compatible',
-      name: 'Underclass (pooled Codex + Copilot)',
+      name: 'Underclass (pooled Codex, Copilot + OpenCode Go)',
       options: { baseURL: location.origin + '/v1', apiKey: '<proxy-key>', setCacheKey: true },
       models
     }},
@@ -478,8 +488,9 @@ async function saveCatalog() {
 }
 
 document.getElementById('flowBackend').addEventListener('change', () => {
-  document.getElementById('enterpriseWrap').style.display =
-    document.getElementById('flowBackend').value === 'copilot' ? 'block' : 'none';
+  const backend = document.getElementById('flowBackend').value;
+  document.getElementById('enterpriseWrap').style.display = backend === 'copilot' ? 'block' : 'none';
+  document.getElementById('opencodeGoWrap').style.display = backend === 'opencode-go' ? 'block' : 'none';
 });
 
 async function startFlow() {
@@ -497,6 +508,13 @@ async function beginFlow() {
   if (backend === 'copilot') {
     const ent = document.getElementById('flowEnterprise').value.trim();
     if (ent) body.enterprise_url = ent;
+  }
+  if (backend === 'opencode-go') {
+    const keyInput = document.getElementById('flowApiKey');
+    body.api_key = keyInput.value.trim();
+    keyInput.value = '';
+    const label = document.getElementById('flowLabel').value.trim();
+    if (label) body.label = label;
   }
   const res = await api('/admin/api/flows', { method: 'POST', body: JSON.stringify(body) });
   if (!res.ok) { alert(await res.text()); return; }
@@ -562,15 +580,20 @@ async function acct(id, action) {
   await api('/admin/api/accounts/' + id + '/' + action, { method: 'POST' });
   loadState();
 }
-async function relogin(id) {
-  const res = await api('/admin/api/accounts/' + id + '/relogin', { method: 'POST' });
-  if (res.ok) {
-    const data = await res.json();
-    document.getElementById('flowDialog').showModal();
-    document.getElementById('flowIdle').style.display = 'none';
-    document.getElementById('flowPending').style.display = 'block';
-    pollFlow(data.flow_id);
+async function relogin(id, backend) {
+  let body;
+  if (backend === 'opencode-go') {
+    const key = prompt('New OpenCode Console API key for this account');
+    if (!key) return;
+    body = JSON.stringify({ api_key: key.trim() });
   }
+  const res = await api('/admin/api/accounts/' + id + '/relogin', { method: 'POST', body });
+  if (!res.ok) { alert(await res.text()); return; }
+  const data = await res.json();
+  document.getElementById('flowDialog').showModal();
+  document.getElementById('flowIdle').style.display = 'none';
+  document.getElementById('flowPending').style.display = 'block';
+  pollFlow(data.flow_id);
 }
 async function refreshToken(id) {
   const res = await api('/admin/api/accounts/' + id + '/refresh', { method: 'POST' });
@@ -602,6 +625,12 @@ async function del(id) {
 }
 async function refreshCopilotCatalog() {
   await api('/admin/api/catalog/refresh-copilot', { method: 'POST' });
+  loadState();
+}
+async function refreshOpencodeGoCatalog() {
+  const res = await api('/admin/api/catalog/refresh-opencode-go', { method: 'POST' });
+  const data = await res.json().catch(() => ({}));
+  if (data.errors && data.errors.length) alert(data.errors.join('\n'));
   loadState();
 }
 function copySnippet() {

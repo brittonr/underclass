@@ -186,10 +186,11 @@ impl PoolCore {
 
     /// @cc [owner:ghuntley,label:pool] select-sticky-healthy-never-unhealthy
     /// Selection MUST return, in priority order: (1) the account bound to the sticky key when it
-    /// is Healthy and serves the model (decision `StickyHit`); (2) on rebinding, a Healthy account
-    /// of the bound account's backend when one exists, else any Healthy eligible account; (3) for
-    /// sticky misses, the least-in-flight Healthy eligible account. It MUST NOT ever return an
-    /// account that is Cooling, AuthError, or Disabled. When no eligible Healthy account exists it
+    /// is Healthy, serves the model and is not cooling for it (decision `StickyHit`); (2) on
+    /// rebinding, a Healthy account of the bound account's backend when one exists, else any
+    /// Healthy eligible account; (3) for sticky misses, the least-in-flight Healthy eligible
+    /// account. It MUST NOT ever return an account that is Cooling, AuthError, or Disabled, or one
+    /// cooling for the requested model. When no eligible Healthy account exists it
     /// MUST fail with `Saturated { until_ms = min reset_at over eligible cooling accounts }` or,
     /// if none are cooling, `NoAccounts`. Requests without a sticky key MUST NOT create bindings.
     /// Only backends that declare the requested `surface` are eligible.
@@ -249,6 +250,9 @@ impl PoolCore {
                         if state.account.healthy()
                             && backends.contains(&state.account.backend)
                             && !exclude.contains(&bound_id)
+                            && self
+                                .model_cooling_until(&bound_id, model)
+                                .is_none_or(|until_ms| until_ms <= now)
                         {
                             return Ok(Selection {
                                 account_id: bound_id.clone(),

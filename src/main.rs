@@ -1,7 +1,7 @@
 use underclass::provider::BackendMap;
 use underclass::{
-    claude, cli, codex, config, copilot, flows, logging, models, monitor, pool, proxy, stats_api,
-    store, tokens, top, ui,
+    claude, cli, codex, config, copilot, flows, logging, models, monitor, opencode_go, pool, proxy,
+    stats_api, store, tokens, top, ui,
 };
 
 use clap::{Parser, Subcommand};
@@ -19,6 +19,8 @@ const STATS_TICK: std::time::Duration = std::time::Duration::from_secs(900);
 /// How often the Claude Code accounts' own usage is polled: plan, quota windows, and banked
 /// reset credits.
 const CLAUDE_USAGE_POLL: std::time::Duration = std::time::Duration::from_secs(120);
+/// How often the OpenCode Go accounts' allowance windows are polled.
+const OPENCODE_GO_USAGE_POLL: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Parser)]
 #[command(
@@ -166,6 +168,11 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         copilot::fallback_catalog(),
     );
     seed_catalog(&store, models::BackendId::Claude, claude::default_catalog());
+    seed_catalog(
+        &store,
+        models::BackendId::OpencodeGo,
+        opencode_go::default_catalog(),
+    );
 
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -190,6 +197,12 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         models::BackendId::Claude,
         Arc::new(claude::ClaudeBackend {
             cooldown_ms: cfg.claude_cooldown_ms,
+        }),
+    );
+    backends.insert(
+        models::BackendId::OpencodeGo,
+        Arc::new(opencode_go::OpencodeGoBackend {
+            cooldown_ms: cfg.opencode_go_cooldown_ms,
         }),
     );
     // The pool learns which surfaces each backend serves from the backends themselves.
@@ -266,6 +279,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
 
     refresh_copilot_catalogs_on_boot(&state).await;
     refresh_claude_catalogs_on_boot(&state).await;
+    refresh_opencode_go_catalog_on_boot(&state).await;
     refresh_identities_on_boot(&state).await;
     {
         let state = state.clone();
@@ -273,6 +287,15 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
             loop {
                 poll_claude_usage(&state).await;
                 tokio::time::sleep(CLAUDE_USAGE_POLL).await;
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                poll_opencode_go_usage(&state).await;
+                tokio::time::sleep(OPENCODE_GO_USAGE_POLL).await;
             }
         });
     }
@@ -389,6 +412,10 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         .route(
             "/admin/api/catalog/refresh-copilot",
             axum::routing::post(ui::refresh_copilot_catalog),
+        )
+        .route(
+            "/admin/api/catalog/refresh-opencode-go",
+            axum::routing::post(ui::refresh_opencode_go_catalog),
         )
         .route("/admin/api/client-key", axum::routing::get(ui::client_key))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -534,6 +561,15 @@ async fn refresh_claude_catalogs_on_boot(state: &Arc<proxy::AppState>) {
     }
 }
 
+/// Refreshes the OpenCode Go catalog from the gateway's live model list.
+async fn refresh_opencode_go_catalog_on_boot(state: &Arc<proxy::AppState>) {
+    let (_, errors) =
+        opencode_go::refresh_catalog_from_pool(&state.client, &state.store, &state.pool).await;
+    for error in errors {
+        tracing::warn!(error = %error, "opencode_go.catalog_refresh_failed");
+    }
+}
+
 /// Polls each Claude account's own usage API for its plan, quota windows, and banked reset
 /// credits, and cools an account whose window is spent.
 ///
@@ -619,6 +655,46 @@ async fn poll_claude_usage(state: &Arc<proxy::AppState>) {
             "cooling",
             &format!("subscription window exhausted until {until}"),
         );
+    }
+}
+
+/// Polls each OpenCode Go account's allowance windows for the admin UI and monitor.
+///
+/// The windows are observations only. A spent allowance still serves the free models, and
+/// OpenCode's Extra Usage setting can serve paid ones from the pay-as-you-go balance, so only an
+/// upstream refusal cools a model on an account.
+async fn poll_opencode_go_usage(state: &Arc<proxy::AppState>) {
+    let accounts: Vec<models::Account> = state
+        .store
+        .list_accounts()
+        .into_iter()
+        .filter(|a| a.backend == models::BackendId::OpencodeGo)
+        .filter(|a| a.status != models::AccountStatus::Disabled)
+        .collect();
+    for account in accounts {
+        let result = match state.tokens.access_token(&account).await {
+            Ok(token) => opencode_go::fetch_usage(&state.client, &token)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        match result {
+            Ok(snapshot) => {
+                state
+                    .observations
+                    .lock()
+                    .unwrap()
+                    .insert(account.id.clone(), opencode_go::usage_view(&snapshot));
+            }
+            Err(e) => {
+                logging::log_account_state(
+                    &account.id,
+                    Some(&account.label),
+                    "usage_poll_failed",
+                    &e,
+                );
+            }
+        }
     }
 }
 
@@ -721,6 +797,8 @@ async fn refresh_identities_on_boot(state: &Arc<proxy::AppState>) {
                     Err(_) => None,
                 }
             }
+            // An OpenCode Go key carries no identity beyond the label it was enrolled with.
+            models::BackendId::OpencodeGo => continue,
         };
         let Some(identity) = identity else {
             continue;
