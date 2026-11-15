@@ -7,6 +7,7 @@ use underclass::claude::ClaudeBackend;
 use underclass::codex::CodexBackend;
 use underclass::copilot::CopilotBackend;
 use underclass::flows::FlowRegistry;
+use underclass::gemini::GeminiBackend;
 use underclass::models::{
     Account, AccountStatus, BackendId, ModelInfo, RequestLogEntry, Surface, now_ms,
 };
@@ -31,6 +32,7 @@ struct MockState {
     rotate_on_forbidden: std::collections::HashMap<String, (Arc<Store>, String, String)>,
     disable_on_forbidden: std::collections::HashMap<String, (Arc<AppState>, String)>,
     gates: std::collections::HashMap<String, Arc<ResponseGate>>,
+    gemini_seen: VecDeque<(String, String, String)>,
 }
 
 #[derive(Default)]
@@ -112,6 +114,55 @@ fn mock_opencode_go(
         .into_response()
 }
 
+fn mock_gemini(
+    state: &Arc<Mutex<MockState>>,
+    bearer: &str,
+    uri: &axum::http::Uri,
+    body: &str,
+) -> Response {
+    state.lock().unwrap().gemini_seen.push_back((
+        bearer.to_string(),
+        uri.path().to_string(),
+        body.to_string(),
+    ));
+    if bearer.starts_with("gem-quota-") {
+        state
+            .lock()
+            .unwrap()
+            .fourtwonined
+            .push_back(bearer.to_string());
+        return axum::response::Response::builder()
+            .status(axum::http::StatusCode::TOO_MANY_REQUESTS)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"Resource has been exhausted","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"30s"}]}}"#,
+            ))
+            .unwrap();
+    }
+    let payload = r#"{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"hello from gemini"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3,"totalTokenCount":8}}}"#;
+    if uri.path().contains("streamGenerateContent") {
+        let stream = "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello from gemini\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":3,\"totalTokenCount\":8}}}\n\n";
+        return (
+            axum::http::StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/event-stream".to_string(),
+            )],
+            stream.to_string(),
+        )
+            .into_response();
+    }
+    (
+        axum::http::StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".to_string(),
+        )],
+        payload.to_string(),
+    )
+        .into_response()
+}
+
 async fn mock_responses(
     State(state): State<Arc<Mutex<MockState>>>,
     headers: axum::http::HeaderMap,
@@ -130,6 +181,9 @@ async fn mock_responses(
     if let Some(gate) = gate {
         gate.entered.notify_one();
         gate.release.notified().await;
+    }
+    if uri.path().contains("v1internal") {
+        return mock_gemini(&state, &bearer, &uri, &body);
     }
     if state.lock().unwrap().server_errors.contains(&bearer) {
         return (
@@ -469,6 +523,7 @@ fn mock_upstream() -> &'static Arc<Mutex<MockState>> {
             std::env::set_var("UNDERCLASS_COPILOT_UPSTREAM", format!("http://{addr}"));
             std::env::set_var("UNDERCLASS_CLAUDE_UPSTREAM", format!("http://{addr}"));
             std::env::set_var("UNDERCLASS_OPENCODE_GO_UPSTREAM", format!("http://{addr}"));
+            std::env::set_var("UNDERCLASS_GEMINI_UPSTREAM", format!("http://{addr}"));
         }
         format!("http://{addr}")
     });
@@ -582,6 +637,7 @@ async fn spawn_app_with_resets(
         BackendId::OpencodeGo,
         Arc::new(OpencodeGoBackend { cooldown_ms }),
     );
+    backends.insert(BackendId::Gemini, Arc::new(GeminiBackend { cooldown_ms }));
     let core = PoolCore::new(&store, backend_surfaces(&backends));
     let pool = Arc::new(Mutex::new(core));
     let logs: Arc<Mutex<VecDeque<RequestLogEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -2431,4 +2487,158 @@ async fn e2e_opencode_go_spent_allowance_cools_only_the_refused_model() {
         store.get_account("go-spent-1").unwrap().status,
         AccountStatus::Healthy
     );
+}
+
+fn gemini_account(id: &str, token: &str, project: &str) -> Account {
+    let mut account = account(id, BackendId::Gemini, token);
+    account.account_id = Some(project.into());
+    account.plan = Some("Google AI Ultra".into());
+    account
+}
+
+/// A Gemini chat completion is translated onto Code Assist, answered as an OpenAI chat
+/// completion, and a second Gemini account takes over when the first is quota-exhausted.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_gemini_translates_chat_and_cools_on_resource_exhausted() {
+    let mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.upsert_account(&gemini_account(
+        "gem-1-quota",
+        "gem-quota-ultra",
+        "projects/ultra-a",
+    ));
+    store.upsert_account(&gemini_account(
+        "gem-2-ok",
+        "gem-ok-ultra",
+        "projects/ultra-b",
+    ));
+    store.set_catalog(
+        BackendId::Gemini,
+        &[ModelInfo {
+            context: 1_048_576,
+            ..model("gemini-2.5-pro")
+        }],
+    );
+    let (base, _logs) = spawn_app(store.clone(), 60_000).await;
+    let client = reqwest::Client::new();
+    let chat: serde_json::Value = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key")
+        .json(&serde_json::json!({
+            "model": "gemini-2.5-pro",
+            "messages": [{"role": "user", "content": "ping-gemini-unique"}],
+            "prompt_cache_key": "sess-gemini"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        chat["choices"][0]["message"]["content"],
+        "hello from gemini"
+    );
+    assert_eq!(chat["usage"]["prompt_tokens"], 5);
+    assert_eq!(chat["usage"]["completion_tokens"], 3);
+    let seen = mock.lock().unwrap().gemini_seen.clone();
+    let ok = seen
+        .iter()
+        .find(|(bearer, _, body)| bearer == "gem-ok-ultra" && body.contains("ping-gemini-unique"))
+        .expect("translated request");
+    assert_eq!(ok.0, "gem-ok-ultra");
+    assert!(ok.1.contains("generateContent"));
+    assert!(!ok.1.contains("streamGenerateContent"));
+    let upstream: serde_json::Value = serde_json::from_str(&ok.2).unwrap();
+    assert_eq!(upstream["project"], "projects/ultra-b");
+    assert_eq!(upstream["model"], "gemini-2.5-pro");
+    assert_eq!(upstream["request"]["session_id"], "sess-gemini");
+    assert_eq!(
+        upstream["request"]["contents"][0]["parts"][0]["text"],
+        "ping-gemini-unique"
+    );
+    assert!(!ok.2.contains("test-key"));
+    assert_eq!(
+        store.get_account("gem-1-quota").unwrap().status,
+        AccountStatus::Cooling
+    );
+    let cooled = store.get_account("gem-1-quota").unwrap();
+    assert!(cooled.reset_at > now_ms());
+
+    let sticky: serde_json::Value = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key")
+        .json(&serde_json::json!({
+            "model": "gemini-2.5-pro",
+            "messages": [{"role": "user", "content": "ping-gemini-sticky"}],
+            "prompt_cache_key": "sess-gemini"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        sticky["choices"][0]["message"]["content"],
+        "hello from gemini"
+    );
+    let seen = mock.lock().unwrap().gemini_seen.clone();
+    let sticky_hit = seen
+        .iter()
+        .find(|(_, _, body)| body.contains("ping-gemini-sticky"))
+        .expect("sticky request");
+    assert_eq!(sticky_hit.0, "gem-ok-ultra");
+
+    let streamed = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key")
+        .json(&serde_json::json!({
+            "model": "gemini-2.5-pro",
+            "stream": true,
+            "messages": [{"role": "user", "content": "ping-gemini-stream"}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(streamed.contains("hello from gemini"));
+    assert!(streamed.contains("[DONE]"));
+
+    let anthropic: serde_json::Value = client
+        .post(format!("{base}/v1/messages"))
+        .header("Authorization", "Bearer test-key")
+        .json(&serde_json::json!({
+            "model": "gemini-2.5-pro",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "ping-gemini-anthropic"}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(anthropic["content"][0]["text"], "hello from gemini");
+    assert_eq!(anthropic["usage"]["input_tokens"], 5);
+    assert_eq!(anthropic["stop_reason"], "end_turn");
+
+    let models: serde_json::Value = client
+        .get(format!("{base}/v1/models"))
+        .header("Authorization", "Bearer test-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let owned = models["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["id"] == "gemini-2.5-pro")
+        .unwrap();
+    assert_eq!(owned["owned_by"], "underclass-gemini");
 }

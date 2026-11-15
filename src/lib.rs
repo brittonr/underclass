@@ -5,6 +5,7 @@ pub mod config;
 pub mod copilot;
 pub mod correlation;
 pub mod flows;
+pub mod gemini;
 pub mod health;
 pub mod jwt;
 pub mod logging;

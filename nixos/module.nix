@@ -30,7 +30,7 @@ let
 in
 {
   options.services.underclass = {
-    enable = mkEnableOption "underclass, the pooled ChatGPT/Codex + Copilot subscription proxy";
+    enable = mkEnableOption "underclass, the pooled ChatGPT/Codex, Copilot, Claude, OpenCode Go, and Gemini subscription proxy";
 
     package = mkOption {
       type = types.package;
@@ -67,7 +67,9 @@ in
       description = ''
         Path to an environment file loaded by the service, for secrets:
         UNDERCLASS_PROXY_KEY and UNDERCLASS_UI_TOKEN (underclass mints both
-        when absent). Use this instead of putting secrets into the Nix store.
+        when absent), plus UNDERCLASS_GEMINI_CLIENT_ID and
+        UNDERCLASS_GEMINI_CLIENT_SECRET when pooling a Google AI Ultra account.
+        Use this instead of putting secrets into the Nix store.
       '';
     };
 

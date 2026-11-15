@@ -28,6 +28,10 @@ pub enum FlowState {
 pub struct OAuthState {
     pub verifier: String,
     pub state: String,
+    /// Operator-supplied Code Assist project id, for tiers that require one.
+    pub project: Option<String>,
+    /// Operator-supplied account label. Empty means the backend chooses one.
+    pub label: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

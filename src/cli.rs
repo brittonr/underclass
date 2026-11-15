@@ -48,10 +48,123 @@ pub struct RefreshArgs {
         conflicts_with = "all"
     )]
     pub account: Option<String>,
-    #[arg(long, help = "refresh every ChatGPT/Codex and Claude Code account")]
+    #[arg(
+        long,
+        help = "refresh every account whose token refreshes with its issuer"
+    )]
     pub all: bool,
     #[arg(long, help = "server URL (requires UNDERCLASS_UI_TOKEN)")]
     pub url: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+pub struct LoginArgs {
+    /// Which backend to sign in. Only `gemini` is supported; the other backends use the web UI.
+    #[arg(long, default_value = "gemini")]
+    pub backend: String,
+    #[arg(long, help = "server URL (requires UNDERCLASS_UI_TOKEN)")]
+    pub url: Option<String>,
+    /// Google Cloud project id for a Code Assist tier that requires one.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Account label. Defaults to the Google account's email.
+    #[arg(long)]
+    pub label: Option<String>,
+    /// Authorization code from the Code Assist page. Read from stdin when omitted.
+    #[arg(long)]
+    pub code: Option<String>,
+}
+
+/// @cc [owner:ghuntley,label:cli] gemini-login-via-admin-api
+/// `login` MUST add a Gemini account only through the running server's authenticated admin API
+/// (POST `/admin/api/flows`, then POST `/admin/api/flows/{id}/code`) and MUST NOT read or write
+/// the local database. It MUST print the authorize URL and MUST NOT print the authorization
+/// code, the access token, or the refresh token.
+pub fn login(args: &LoginArgs) -> Result<(), String> {
+    if args.backend != "gemini" {
+        return Err(
+            "underclass login supports gemini; add Codex, Copilot, Claude, and OpenCode Go from the web UI"
+                .into(),
+        );
+    }
+    let admin = AdminApi::connect_timeout(args.url.clone(), Duration::from_secs(180))?;
+    let mut body = serde_json::json!({ "backend": "gemini" });
+    if let Some(project) = args
+        .project
+        .as_deref()
+        .filter(|project| !project.is_empty())
+    {
+        body["project"] = serde_json::Value::String(project.to_string());
+    }
+    if let Some(label) = args.label.as_deref().filter(|label| !label.is_empty()) {
+        body["label"] = serde_json::Value::String(label.to_string());
+    }
+    let started = admin
+        .client
+        .post(format!("{}/admin/api/flows", admin.url))
+        .bearer_auth(&admin.token)
+        .json(&body)
+        .send()
+        .map_err(|error| format!("cannot reach {}: {error}", admin.url))?;
+    let status = started.status();
+    let started: Value = started
+        .json()
+        .map_err(|error| format!("login response: {error}"))?;
+    if !status.is_success() {
+        let message = started["message"]
+            .as_str()
+            .or_else(|| started["error"].as_str())
+            .unwrap_or("could not start the Google sign-in");
+        return Err(format!("{message} (HTTP {})", status.as_u16()));
+    }
+    let flow_id = started["flow_id"]
+        .as_str()
+        .ok_or_else(|| "the server did not return a flow id".to_string())?;
+    let authorize_url = started
+        .pointer("/flow/state/authorize_url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "the server did not return an authorize URL".to_string())?;
+    eprintln!(
+        "Open this URL in a browser, sign in with the Google AI Ultra account, and paste the code the page shows.\n"
+    );
+    println!("{authorize_url}");
+    let code = match args.code.as_deref() {
+        Some(code) => code.trim().to_string(),
+        None => {
+            eprint!("Authorization code: ");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .map_err(|error| format!("could not read the authorization code: {error}"))?;
+            line.trim().to_string()
+        }
+    };
+    if code.is_empty() {
+        return Err("no authorization code".into());
+    }
+    let finished = admin
+        .client
+        .post(format!("{}/admin/api/flows/{flow_id}/code", admin.url))
+        .bearer_auth(&admin.token)
+        .json(&serde_json::json!({ "code": code }))
+        .send()
+        .map_err(|error| format!("login request failed: {error}"))?;
+    let status = finished.status();
+    let finished: Value = finished.json().unwrap_or(Value::Null);
+    if !status.is_success() {
+        let message = finished["message"]
+            .as_str()
+            .or_else(|| finished["error"].as_str())
+            .unwrap_or("Google did not accept the authorization code");
+        return Err(format!("{message} (HTTP {})", status.as_u16()));
+    }
+    println!(
+        "added {} ({})",
+        finished["label"].as_str().unwrap_or("gemini"),
+        finished["plan"].as_str().unwrap_or("unknown plan"),
+    );
+    Ok(())
 }
 
 /// One row of the admin state's account list, as much as the CLI needs to pick a target.
@@ -137,10 +250,14 @@ struct AdminApi {
 
 impl AdminApi {
     fn connect(url: Option<String>) -> Result<Self, String> {
+        Self::connect_timeout(url, Duration::from_secs(30))
+    }
+
+    fn connect_timeout(url: Option<String>, timeout: Duration) -> Result<Self, String> {
         let config = crate::config::Config::load();
         let (url, token) = crate::top::admin_http_target(&config, url)?;
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| format!("http client: {e}"))?;
@@ -500,6 +617,7 @@ pub fn connect(args: &ConnectArgs, underclass_store: &crate::store::Store) -> Re
         crate::models::BackendId::Codex,
         crate::models::BackendId::Copilot,
         crate::models::BackendId::OpencodeGo,
+        crate::models::BackendId::Gemini,
     ] {
         for m in underclass_store.catalog(backend) {
             if seen.insert(m.id.clone()) {
