@@ -1096,6 +1096,8 @@ pub async fn start_flow(
         Some(OAuthState {
             verifier: pkce.verifier,
             state: pkce.state,
+            project: None,
+            label: None,
         }),
     );
     let _ = store;

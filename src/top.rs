@@ -659,6 +659,9 @@ fn quota(account: &MonitorAccount, now_ms: i64) -> String {
     if matches!(account.backend, BackendId::Claude | BackendId::OpencodeGo) {
         return observed_quota(account);
     }
+    if account.backend == BackendId::Gemini {
+        return gemini_quota(account);
+    }
     let Some(snapshot) = &account.quota else {
         return "waiting…".into();
     };
@@ -711,6 +714,67 @@ fn observed_remaining(account: &MonitorAccount) -> Option<Vec<(&'static str, f64
             })
             .collect(),
     )
+}
+
+fn gemini_quota_color(account: &MonitorAccount) -> Color {
+    let Some(fraction) = account
+        .observation
+        .as_ref()
+        .and_then(|observation| observation.get("buckets"))
+        .and_then(|buckets| buckets.as_array())
+        .and_then(|buckets| {
+            buckets
+                .iter()
+                .filter_map(|bucket| bucket.get("remaining_fraction").and_then(|v| v.as_f64()))
+                .reduce(f64::min)
+        })
+    else {
+        return MUTED;
+    };
+    let remaining = (fraction * 100.0).clamp(0.0, 100.0);
+    if remaining <= 10.0 {
+        RED
+    } else if remaining <= 30.0 {
+        YELLOW
+    } else {
+        GREEN
+    }
+}
+
+/// Code Assist quota buckets, as the last `retrieveUserQuota` poll reported them.
+fn gemini_quota(account: &MonitorAccount) -> String {
+    let Some(observation) = account.observation.as_ref() else {
+        return "waiting…".into();
+    };
+    let Some(buckets) = observation
+        .get("buckets")
+        .and_then(|buckets| buckets.as_array())
+    else {
+        return observation
+            .get("status")
+            .and_then(|status| status.as_str())
+            .unwrap_or("waiting…")
+            .to_string();
+    };
+    let mut parts = Vec::new();
+    for bucket in buckets.iter().take(3) {
+        let model = bucket
+            .get("model")
+            .and_then(|model| model.as_str())
+            .filter(|model| !model.is_empty())
+            .unwrap_or("quota");
+        let left = bucket
+            .get("remaining_fraction")
+            .and_then(|fraction| fraction.as_f64())
+            .map(|fraction| format!("{:.0}%", (fraction * 100.0).clamp(0.0, 100.0)))
+            .unwrap_or_else(|| "?".into());
+        parts.push(format!("{model} {left}"));
+    }
+    if parts.is_empty() {
+        "unavailable".into()
+    } else {
+        parts.join(" · ")
+    }
 }
 
 /// The subscription windows, as the account's own usage API last reported them.
@@ -767,6 +831,9 @@ fn observed_quota_color(account: &MonitorAccount) -> Color {
 fn quota_color(account: &MonitorAccount, now_ms: i64) -> Color {
     if matches!(account.backend, BackendId::Claude | BackendId::OpencodeGo) {
         return observed_quota_color(account);
+    }
+    if account.backend == BackendId::Gemini {
+        return gemini_quota_color(account);
     }
     if account.backend != BackendId::Codex {
         return MUTED;
