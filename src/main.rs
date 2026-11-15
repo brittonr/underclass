@@ -570,8 +570,49 @@ async fn refresh_opencode_go_catalog_on_boot(state: &Arc<proxy::AppState>) {
     }
 }
 
+/// @cc [owner:ghuntley,label:pool] claude-usage-readmission
+/// A fresh Claude usage snapshot MUST readmit a Cooling account only when at least one window
+/// reports utilization below 100% and every reported window has valid headroom. Exhausted or
+/// unknown usage MUST NOT clear a cooldown; a future exhausted-window deadline MAY extend it
+/// but MUST NOT shorten it. Other account statuses MUST NOT be readmitted by usage polling.
+fn claude_quota_transition(
+    status: models::AccountStatus,
+    reset_at: i64,
+    snapshot: &claude::UsageSnapshot,
+    now: i64,
+) -> Option<(models::AccountStatus, i64)> {
+    if let Some(until) = snapshot.exhausted_reset_ms()
+        && until > now
+        && until > reset_at
+    {
+        return Some((models::AccountStatus::Cooling, until));
+    }
+    if status != models::AccountStatus::Cooling {
+        return None;
+    }
+    let mut observed = false;
+    for utilization in [
+        snapshot.five_hour.utilization,
+        snapshot.seven_day.utilization,
+        snapshot.seven_day_fable.utilization,
+    ] {
+        let Some(used) = utilization else {
+            continue;
+        };
+        if !(0.0..1.0).contains(&used) {
+            return None;
+        }
+        observed = true;
+    }
+    observed.then_some((models::AccountStatus::Healthy, 0))
+}
+
+/// @cc [owner:ghuntley,label:pool] claude-poll-persists-quota-recovery
+/// `poll_claude_usage` MUST update the in-memory pool and SQLite status together when a
+/// successfully fetched usage snapshot changes an account's quota state. A failed usage fetch
+/// MUST leave the account status unchanged and MUST NOT redeem any reset credit.
 /// Polls each Claude account's own usage API for its plan, quota windows, and banked reset
-/// credits, and cools an account whose window is spent.
+/// credits, and reconciles its cooldown with those windows.
 ///
 /// The account usage API is a first-party endpoint, so this never sends anything that looks like
 /// a Claude Code request.
@@ -622,39 +663,38 @@ async fn poll_claude_usage(state: &Arc<proxy::AppState>) {
             state.store.upsert_account(&updated);
             state.pool.lock().unwrap().sync_account(updated);
         }
-        let Some(until) = snapshot.exhausted_reset_ms() else {
-            continue;
-        };
         let now = models::now_ms();
-        if until <= now {
-            continue;
-        }
-        let current = {
-            state
-                .pool
-                .lock()
-                .unwrap()
-                .account(&account.id)
-                .map(|a| a.reset_at)
-                .unwrap_or(0)
+        let transition = {
+            let mut pool = state.pool.lock().unwrap();
+            let next = pool.account(&account.id).and_then(|current| {
+                claude_quota_transition(current.status, current.reset_at, &snapshot, now)
+            });
+            if let Some((status, reset_at)) = next {
+                pool.set_status(&account.id, status, reset_at);
+            }
+            next
         };
-        if until <= current {
+        let Some((status, reset_at)) = transition else {
             continue;
-        }
-        state
-            .pool
-            .lock()
-            .unwrap()
-            .set_status(&account.id, models::AccountStatus::Cooling, until);
+        };
         state
             .store
-            .update_account_status(&account.id, models::AccountStatus::Cooling, until);
-        logging::log_account_state(
-            &account.id,
-            Some(&account.label),
-            "cooling",
-            &format!("subscription window exhausted until {until}"),
-        );
+            .update_account_status(&account.id, status, reset_at);
+        if status == models::AccountStatus::Healthy {
+            logging::log_account_state(
+                &account.id,
+                Some(&account.label),
+                "recovered",
+                "subscription usage has headroom",
+            );
+        } else {
+            logging::log_account_state(
+                &account.id,
+                Some(&account.label),
+                "cooling",
+                &format!("subscription window exhausted until {reset_at}"),
+            );
+        }
     }
 }
 
@@ -812,5 +852,64 @@ async fn refresh_identities_on_boot(state: &Arc<proxy::AppState>) {
         state.store.upsert_account(&updated);
         state.pool.lock().unwrap().sync_account(updated);
         tracing::info!(account = %account.id, "account.identity_refreshed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_headroom_readmits_stale_claude_cooldown() {
+        let mut usage = claude::UsageSnapshot::default();
+        usage.seven_day.utilization = Some(0.6);
+        usage.seven_day_fable.utilization = Some(0.84);
+        assert_eq!(
+            claude_quota_transition(models::AccountStatus::Cooling, 10_000, &usage, 1_000),
+            Some((models::AccountStatus::Healthy, 0))
+        );
+    }
+
+    #[test]
+    fn exhausted_or_unknown_usage_cannot_readmit_claude() {
+        let mut usage = claude::UsageSnapshot::default();
+        assert_eq!(
+            claude_quota_transition(models::AccountStatus::Cooling, 10_000, &usage, 1_000),
+            None
+        );
+        usage.seven_day.utilization = Some(0.6);
+        usage.five_hour.utilization = Some(1.0);
+        assert_eq!(
+            claude_quota_transition(models::AccountStatus::Cooling, 10_000, &usage, 1_000),
+            None
+        );
+    }
+
+    #[test]
+    fn exhausted_usage_only_extends_cooldown() {
+        let mut usage = claude::UsageSnapshot::default();
+        usage.seven_day.utilization = Some(1.0);
+        usage.seven_day.resets_at_ms = Some(20_000);
+        assert_eq!(
+            claude_quota_transition(models::AccountStatus::Cooling, 10_000, &usage, 1_000),
+            Some((models::AccountStatus::Cooling, 20_000))
+        );
+        assert_eq!(
+            claude_quota_transition(models::AccountStatus::Cooling, 30_000, &usage, 1_000),
+            None
+        );
+    }
+
+    #[test]
+    fn headroom_does_not_clear_non_cooling_account_states() {
+        let mut usage = claude::UsageSnapshot::default();
+        usage.seven_day.utilization = Some(0.6);
+        for status in [
+            models::AccountStatus::Healthy,
+            models::AccountStatus::AuthError,
+            models::AccountStatus::Disabled,
+        ] {
+            assert_eq!(claude_quota_transition(status, 0, &usage, 1_000), None);
+        }
     }
 }
