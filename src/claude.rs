@@ -173,6 +173,7 @@ fn header_window(headers: &HeaderMap, utilization: &str, reset: &str) -> Option<
         .ok()
         .map(|seconds| seconds.saturating_mul(1000))?;
     Some(UsageWindow {
+        reported: true,
         utilization: Some(utilization),
         resets_at_ms: Some(resets_at_ms),
     })
@@ -186,7 +187,9 @@ pub fn canonical_model(model: &str) -> String {
 /// One quota window as the account's own usage API reports it.
 #[derive(Clone, Debug, Default)]
 pub struct UsageWindow {
-    /// Fraction of the window consumed, 0.0 to 1.0.
+    /// A non-null window was reported. Missing/invalid utilization is not headroom.
+    pub reported: bool,
+    /// Fraction of the window consumed; values at or above 1.0 are exhausted.
     pub utilization: Option<f64>,
     /// When the window resets, in epoch milliseconds.
     pub resets_at_ms: Option<i64>,
@@ -205,30 +208,51 @@ pub struct UsageSnapshot {
 }
 
 impl UsageSnapshot {
-    /// The earliest reset among the windows that are fully consumed.
+    /// @cc [owner:ghuntley,label:pool] claude-shared-exhaustion-deadline
+    /// Account exhaustion MUST consider only shared five-hour/seven-day windows and MUST
+    /// return the latest exhausted reset strictly after the observation time, never a family reset.
     pub fn exhausted_reset_ms(&self) -> Option<i64> {
-        [&self.five_hour, &self.seven_day, &self.seven_day_fable]
+        [&self.five_hour, &self.seven_day]
             .into_iter()
             .filter_map(|window| {
                 let utilization = window.utilization?;
-                if utilization >= 1.0 {
+                if utilization.is_finite() && utilization >= 1.0 {
                     window.resets_at_ms
                 } else {
                     None
                 }
             })
-            .min()
+            .filter(|reset| *reset > self.observed_at_ms)
+            .max()
+    }
+
+    /// @cc [owner:ghuntley,label:pool] claude-shared-headroom-evidence
+    /// Headroom MUST require at least one valid shared utilization below 100% and MUST
+    /// reject every reported malformed, negative, nonfinite, or exhausted shared utilization.
+    /// Absent/null shared windows are nonapplicable; family windows MUST NOT affect this result.
+    pub fn shared_headroom(&self) -> bool {
+        let mut observed = false;
+        for window in [&self.five_hour, &self.seven_day] {
+            match window.utilization {
+                Some(used) if (0.0..1.0).contains(&used) => observed = true,
+                None if !window.reported => {}
+                _ => return false,
+            }
+        }
+        observed
     }
 }
 
 /// Parses the account usage payload.
 pub fn parse_usage(body: &Value, now_ms: i64) -> UsageSnapshot {
     let window = |payload: Option<&Value>| UsageWindow {
+        reported: payload.is_some_and(|value| !value.is_null()),
         // The usage API reports percent (`26.0`); everything downstream, like the unified
         // rate-limit headers, works in fractions of the window.
         utilization: payload
             .and_then(|w| w.get("utilization"))
             .and_then(Value::as_f64)
+            .filter(|percent| percent.is_finite() && *percent >= 0.0)
             .map(|percent| percent / 100.0),
         resets_at_ms: payload
             .and_then(|w| w.get("resets_at"))
@@ -290,6 +314,41 @@ pub fn usage_view(snapshot: &UsageSnapshot) -> Value {
         "reset_credits": snapshot.reset_credits,
         "observed_at_ms": snapshot.observed_at_ms,
     })
+}
+
+/// @cc [owner:ghuntley,label:pool] claude-fable-observation-scope
+/// A valid exhausted Fable observation MUST cool only the `claude-fable-` family until its
+/// future reset. Valid headroom or an absent/null nonapplicable Fable window MUST clear only
+/// that family observation, never exact-model HTTP cooldowns. Malformed reported windows and
+/// Disabled/AuthError/deleted accounts MUST NOT change family cooldowns.
+pub fn reconcile_family_quota(
+    core: &mut crate::pool::PoolCore,
+    account_id: &str,
+    snapshot: &UsageSnapshot,
+    now: i64,
+) {
+    if !core.account(account_id).is_some_and(|account| {
+        matches!(
+            account.status,
+            crate::models::AccountStatus::Healthy | crate::models::AccountStatus::Cooling
+        )
+    }) {
+        return;
+    }
+    let family = &snapshot.seven_day_fable;
+    if !family.reported && family.utilization.is_none() {
+        core.clear_model_family_quota(account_id, "claude-fable-");
+        return;
+    }
+    if let Some(used) = family.utilization {
+        if used.is_finite() && used >= 1.0 {
+            if let Some(until) = family.resets_at_ms.filter(|until| *until > now) {
+                core.report_model_family_quota(account_id, "claude-fable-", until);
+            }
+        } else if (0.0..1.0).contains(&used) {
+            core.clear_model_family_quota(account_id, "claude-fable-");
+        }
+    }
 }
 
 /// A banked rate-limit reset credit.
@@ -373,7 +432,7 @@ pub async fn consume_reset_credit(
     if !resp.status().is_success() {
         return Err(AuthError::Status(resp.status().as_u16()));
     }
-    Ok(resp.json().await.unwrap_or(Value::Null))
+    Ok(resp.json().await?)
 }
 
 /// The outcome of an operator-initiated Claude reset redemption.
@@ -411,8 +470,7 @@ impl ClaudeResetError {
     pub fn message(&self) -> String {
         match self {
             ClaudeResetError::NotRateLimited => {
-                "upstream reports this account is not rate limited; use force to redeem anyway"
-                    .into()
+                "upstream reports this account is not rate limited".into()
             }
             ClaudeResetError::NoCredit => "upstream lists no available reset credit".into(),
             ClaudeResetError::Upstream(reason) => format!("upstream call failed: {reason}"),
@@ -420,9 +478,52 @@ impl ClaudeResetError {
     }
 }
 
+/// @cc [owner:ghuntley,label:pool] claude-reset-consume-outcome
+/// Only `reset` and `already_redeemed` MUST count as successful consume outcomes. `no_credit`
+/// MUST return NoCredit, `nothing_to_reset` MUST return NotRateLimited even when forced, and missing, invalid,
+/// or unknown codes MUST return Upstream without changing account status.
+fn reset_consume_code(body: &Value) -> Result<&str, ClaudeResetError> {
+    match body.get("code").and_then(Value::as_str) {
+        Some(code @ ("reset" | "already_redeemed")) => Ok(code),
+        Some("no_credit") => Err(ClaudeResetError::NoCredit),
+        Some("nothing_to_reset") => Err(ClaudeResetError::NotRateLimited),
+        _ => Err(ClaudeResetError::Upstream("consume outcome")),
+    }
+}
+
+/// @cc [owner:ghuntley,label:pool] claude-reset-readmission-guard
+/// Fresh valid shared headroom MAY readmit only a currently Cooling existing account.
+/// Disabled/AuthError/Healthy account statuses and deleted accounts MUST remain unchanged.
+/// Status persistence MUST hold the pool lock through the store write; the returned status
+/// MUST be the current one.
+fn reconcile_reset_status(
+    pool: &Arc<std::sync::Mutex<crate::pool::PoolCore>>,
+    store: &Store,
+    account_id: &str,
+    usage: &UsageSnapshot,
+) -> Result<crate::models::AccountStatus, ClaudeResetError> {
+    let mut core = pool.lock().unwrap();
+    let status = core
+        .account(account_id)
+        .map(|account| account.status)
+        .ok_or(ClaudeResetError::Upstream("account removed"))?;
+    reconcile_family_quota(&mut core, account_id, usage, now_ms());
+    if status == crate::models::AccountStatus::Cooling && usage.shared_headroom() {
+        core.set_status(account_id, crate::models::AccountStatus::Healthy, 0);
+        store.update_account_status(account_id, crate::models::AccountStatus::Healthy, 0);
+        return Ok(crate::models::AccountStatus::Healthy);
+    }
+    Ok(status)
+}
+
 /// @cc [owner:ghuntley,label:pool] claude-manual-reset-redeems-one-credit
-/// `manual_reset` MUST redeem exactly one available banked credit, MUST refuse when the account
-/// is not rate limited unless `force` is set, and MUST readmit the account afterwards.
+/// `manual_reset` MUST consume at most one available credit and MUST refuse when neither shared
+/// nor family exhaustion is reported unless forced. After consumption, only explicit success
+/// followed by fresh valid shared headroom MAY readmit a currently Cooling account. When no
+/// window remains exhausted, fresh pre-consume headroom MUST reconcile an external reset
+/// without spending a credit when not forced.
+/// A confirmed consumption MUST still return its outcome and current status if follow-up usage
+/// is unavailable, without changing status or family cooldowns in the absence of fresh evidence.
 pub async fn manual_reset(
     client: &Client,
     account: &Account,
@@ -434,7 +535,16 @@ pub async fn manual_reset(
     let usage = fetch_usage(client, account, token)
         .await
         .map_err(|_| ClaudeResetError::Upstream("usage"))?;
-    if usage.exhausted_reset_ms().is_none() && !force {
+    let family = &usage.seven_day_fable;
+    let exhausted = usage.exhausted_reset_ms().is_some()
+        || (family
+            .utilization
+            .is_some_and(|used| used.is_finite() && used >= 1.0)
+            && family
+                .resets_at_ms
+                .is_some_and(|reset| reset > usage.observed_at_ms));
+    if !exhausted && !force {
+        reconcile_reset_status(pool, store, &account.id, &usage)?;
         return Err(ClaudeResetError::NotRateLimited);
     }
     let credits = fetch_reset_credits(client, account, token)
@@ -451,25 +561,24 @@ pub async fn manual_reset(
     let body = consume_reset_credit(client, account, token, &credit.id, &request_id)
         .await
         .map_err(|_| ClaudeResetError::Upstream("consume"))?;
-    let code = body
-        .get("code")
-        .and_then(Value::as_str)
-        .unwrap_or("reset")
-        .to_string();
-    // The credit restores the account's windows, so it returns to rotation.
-    {
-        let mut core = pool.lock().unwrap();
-        core.set_status(&account.id, crate::models::AccountStatus::Healthy, 0);
-    }
-    store.update_account_status(&account.id, crate::models::AccountStatus::Healthy, 0);
+    let code = reset_consume_code(&body)?.to_string();
     let remaining = fetch_reset_credits(client, account, token)
         .await
         .map(|credits| credits.iter().filter(|credit| credit.available()).count() as i64)
         .unwrap_or(0);
+    let status = match fetch_usage(client, account, token).await {
+        Ok(usage) => reconcile_reset_status(pool, store, &account.id, &usage)?,
+        Err(_) => pool
+            .lock()
+            .unwrap()
+            .account(&account.id)
+            .map(|account| account.status)
+            .ok_or(ClaudeResetError::Upstream("account removed"))?,
+    };
     Ok(ClaudeResetOutcome {
         outcome: code,
         credit_id: credit.id,
-        status: crate::models::AccountStatus::Healthy,
+        status,
         available_resets: remaining,
     })
 }
@@ -1215,7 +1324,7 @@ impl Backend for ClaudeBackend {
     }
 
     /// @cc [owner:ghuntley,label:pool] claude-exhausted-window-cooling
-    /// `exhausted_until_ms` MUST return the reset of a fully consumed subscription window, so
+    /// `exhausted_until_ms` MUST return the latest reset of fully consumed shared windows, so
     /// the account leaves rotation until the window resets instead of failing a request.
     fn exhausted_until_ms(&self, headers: &HeaderMap) -> Option<i64> {
         [
@@ -1226,7 +1335,7 @@ impl Backend for ClaudeBackend {
         .flatten()
         .filter(|window| window.utilization.unwrap_or_default() >= 1.0)
         .filter_map(|window| window.resets_at_ms)
-        .min()
+        .max()
     }
 }
 
@@ -1308,6 +1417,18 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_shared_headers_use_the_latest_deadline() {
+        let map = headers(&[
+            (UNIFIED_5H_UTILIZATION, "1.0"),
+            (UNIFIED_5H_RESET, "1792506000"),
+            (UNIFIED_7D_UTILIZATION, "1.0"),
+            (UNIFIED_7D_RESET, "1792728000"),
+        ]);
+        let backend = ClaudeBackend { cooldown_ms: 1_000 };
+        assert_eq!(backend.exhausted_until_ms(&map), Some(1_792_728_000_000));
+    }
+
+    #[test]
     fn quota_scope_separates_credential_model_and_request_limits() {
         // The shared five-hour window is rejected: every model on the account is blocked.
         let credential = headers(&[
@@ -1367,7 +1488,103 @@ mod tests {
         assert_eq!(snapshot.plan.as_deref(), Some("max"));
         assert_eq!(snapshot.five_hour.utilization, Some(0.07));
         assert_eq!(snapshot.reset_credits, Some(2));
-        assert!(snapshot.exhausted_reset_ms().is_some());
+        assert_eq!(snapshot.exhausted_reset_ms(), None);
+        assert!(snapshot.shared_headroom());
+    }
+
+    #[test]
+    fn shared_headroom_distinguishes_nonapplicable_from_invalid_windows() {
+        for nonapplicable in [json!({}), json!({"five_hour": null})] {
+            let mut body = nonapplicable;
+            body["seven_day"] = json!({"utilization": 20});
+            assert!(parse_usage(&body, 1_000).shared_headroom(), "{body}");
+        }
+        for invalid in [
+            json!({}),
+            json!({"utilization": null}),
+            json!({"utilization": "unknown"}),
+            json!({"utilization": "20"}),
+            json!({"utilization": -1}),
+            json!({"utilization": 100}),
+            json!({"utilization": 101}),
+            json!([]),
+            json!(false),
+            json!(20),
+        ] {
+            for shared in ["five_hour", "seven_day"] {
+                let mut body = json!({
+                    "five_hour": {"utilization": 20},
+                    "seven_day": {"utilization": 20}
+                });
+                body[shared] = invalid.clone();
+                assert!(!parse_usage(&body, 1_000).shared_headroom(), "{body}");
+            }
+        }
+        for body in [
+            json!({}),
+            json!({"five_hour": null, "seven_day": null}),
+            json!({"seven_day_fable": {"utilization": 20}}),
+        ] {
+            assert!(!parse_usage(&body, 1_000).shared_headroom());
+        }
+        let mut usage = parse_usage(&json!({"five_hour": {"utilization": 0}}), 1_000);
+        assert!(usage.shared_headroom());
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.01, 1.0] {
+            usage.five_hour.utilization = Some(invalid);
+            assert!(!usage.shared_headroom());
+        }
+        usage.five_hour.utilization = Some(0.999);
+        assert!(usage.shared_headroom());
+    }
+
+    #[test]
+    fn shared_exhaustion_uses_latest_future_reset_not_family_or_elapsed_reset() {
+        let mut body = json!({
+            "five_hour": {"utilization": 100, "resets_at": "1970-01-01T00:00:10Z"},
+            "seven_day": {"utilization": 120, "resets_at": "1970-01-01T00:00:20Z"},
+            "seven_day_fable": {"utilization": 100, "resets_at": "1970-01-01T00:00:30Z"}
+        });
+        assert_eq!(parse_usage(&body, 1_000).exhausted_reset_ms(), Some(20_000));
+        assert_eq!(
+            parse_usage(&body, 10_000).exhausted_reset_ms(),
+            Some(20_000)
+        );
+        assert_eq!(parse_usage(&body, 20_000).exhausted_reset_ms(), None);
+        body["seven_day"]["resets_at"] = json!("invalid");
+        assert_eq!(parse_usage(&body, 1_000).exhausted_reset_ms(), Some(10_000));
+        body["five_hour"]["utilization"] = json!(20);
+        assert_eq!(parse_usage(&body, 1_000).exhausted_reset_ms(), None);
+    }
+
+    #[test]
+    fn reset_consume_codes_are_explicit_and_fail_closed() {
+        for code in ["reset", "already_redeemed"] {
+            assert_eq!(reset_consume_code(&json!({"code": code})), Ok(code));
+        }
+        assert_eq!(
+            reset_consume_code(&json!({"code": "no_credit"})),
+            Err(ClaudeResetError::NoCredit)
+        );
+        assert_eq!(
+            reset_consume_code(&json!({"code": "nothing_to_reset"})),
+            Err(ClaudeResetError::NotRateLimited)
+        );
+        for body in [
+            json!({}),
+            json!(null),
+            json!([]),
+            json!({"code": null}),
+            json!({"code": 1}),
+            json!({"code": true}),
+            json!({"code": ""}),
+            json!({"code": "RESET"}),
+            json!({"code": "unknown"}),
+        ] {
+            assert_eq!(
+                reset_consume_code(&body),
+                Err(ClaudeResetError::Upstream("consume outcome"))
+            );
+        }
     }
 
     #[test]

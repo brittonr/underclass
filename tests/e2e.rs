@@ -20,6 +20,7 @@ use underclass::tokens::TokenManager;
 #[derive(Default)]
 struct MockState {
     failing: BTreeSet<String>,
+    server_errors: BTreeSet<String>,
     served_by: VecDeque<String>,
     fourtwonined: VecDeque<String>,
     chat_usage_options: VecDeque<bool>,
@@ -27,6 +28,15 @@ struct MockState {
     /// Remaining 403 responses to serve per bearer token, modelling a redemption-triggered
     /// credential rejection that a token refresh clears.
     forbidden: std::collections::HashMap<String, u32>,
+    rotate_on_forbidden: std::collections::HashMap<String, (Arc<Store>, String, String)>,
+    disable_on_forbidden: std::collections::HashMap<String, (Arc<AppState>, String)>,
+    gates: std::collections::HashMap<String, Arc<ResponseGate>>,
+}
+
+#[derive(Default)]
+struct ResponseGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 /// The OpenCode Go gateway. Like the real one it refuses requests without `x-opencode-session`.
@@ -116,6 +126,19 @@ async fn mock_responses(
         .to_string();
     let wants_stream = body.contains("\"stream\": true") || body.contains("\"stream\":true");
 
+    let gate = state.lock().unwrap().gates.remove(&bearer);
+    if let Some(gate) = gate {
+        gate.entered.notify_one();
+        gate.release.notified().await;
+    }
+    if state.lock().unwrap().server_errors.contains(&bearer) {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"error": {"code": "server_error"}})),
+        )
+            .into_response();
+    }
+
     if bearer.starts_with("bad-") {
         return (
             axum::http::StatusCode::UNAUTHORIZED,
@@ -141,6 +164,24 @@ async fn mock_responses(
             .unwrap()
             .forbidden
             .insert(bearer.clone(), remaining - 1);
+        let rotation = state.lock().unwrap().rotate_on_forbidden.remove(&bearer);
+        if let Some((store, id, token)) = rotation {
+            store.update_tokens(
+                &id,
+                Some(&token),
+                Some(&token),
+                now_ms() + 3_600_000,
+                None,
+                None,
+            );
+        }
+        let disable = state.lock().unwrap().disable_on_forbidden.remove(&bearer);
+        if let Some((app, id)) = disable {
+            let mut pool = app.pool.lock().unwrap();
+            pool.set_status(&id, AccountStatus::Disabled, 0);
+            app.store
+                .update_account_status(&id, AccountStatus::Disabled, 0);
+        }
         return (
             axum::http::StatusCode::FORBIDDEN,
             [(
@@ -167,10 +208,19 @@ async fn mock_responses(
                 .map(str::to_string)
         })
         .unwrap_or_default();
+    if bearer.starts_with("tok-unsupported-") && requested_model == "gpt-6-astra" {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "detail": "The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account."
+            })),
+        ).into_response();
+    }
     let model_scoped_refusal = bearer.starts_with("claude-model-quota-")
         && uri.path().ends_with("/messages")
         && requested_model == "claude-opus-5-5";
     let failing = state.lock().unwrap().failing.contains(&bearer)
+        || bearer.starts_with("tok-late-quota-")
         || (bearer.starts_with("claude-quota-") && uri.path().ends_with("/messages"))
         || model_scoped_refusal;
     if failing {
@@ -240,7 +290,7 @@ async fn mock_responses(
                 .unwrap_or_default()
                 .to_string()
         };
-        return (
+        let mut response = (
             axum::http::StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/json".to_string())],
             serde_json::json!({
@@ -255,6 +305,17 @@ async fn mock_responses(
             .to_string(),
         )
             .into_response();
+        if bearer.starts_with("claude-late-window-") {
+            response.headers_mut().insert(
+                "anthropic-ratelimit-unified-5h-utilization",
+                "1.0".parse().unwrap(),
+            );
+            response.headers_mut().insert(
+                "anthropic-ratelimit-unified-5h-reset",
+                (now_ms() / 1000 + 3600).to_string().parse().unwrap(),
+            );
+        }
+        return response;
     }
     let chat = uri.path().ends_with("/chat/completions");
     if chat {
@@ -496,7 +557,22 @@ async fn spawn_app(
     store: Arc<Store>,
     cooldown_ms: i64,
 ) -> (String, Arc<Mutex<VecDeque<RequestLogEntry>>>) {
-    let client = reqwest::Client::new();
+    let resets = Arc::new(underclass::resets::ResetManager::new(
+        reqwest::Client::new(),
+        "http://127.0.0.1:1".to_string(),
+        false,
+    ));
+    let (base, state) =
+        spawn_app_with_resets(store, cooldown_ms, resets, reqwest::Client::new()).await;
+    (base, state.logs.clone())
+}
+
+async fn spawn_app_with_resets(
+    store: Arc<Store>,
+    cooldown_ms: i64,
+    resets: Arc<underclass::resets::ResetManager>,
+    client: reqwest::Client,
+) -> (String, Arc<AppState>) {
     let tokens = Arc::new(TokenManager::new(store.clone(), client.clone()));
     let mut backends: BackendMap = std::collections::HashMap::new();
     backends.insert(BackendId::Codex, Arc::new(CodexBackend { cooldown_ms }));
@@ -519,11 +595,7 @@ async fn spawn_app(
         flows: FlowRegistry::default(),
         proxy_key: Some("test-key".to_string()),
         ui_token: "unused".to_string(),
-        resets: Arc::new(underclass::resets::ResetManager::new(
-            reqwest::Client::new(),
-            "http://127.0.0.1:1".to_string(),
-            false,
-        )),
+        resets,
         stream_usage_unsupported: Mutex::new(Default::default()),
         observations: Mutex::new(Default::default()),
         stats_retention_days: 730,
@@ -583,6 +655,10 @@ async fn spawn_app(
             axum::routing::get(underclass::stats_api::stats_handler),
         )
         .route(
+            "/admin/api/accounts/{id}/disable",
+            axum::routing::post(underclass::ui::disable_account),
+        )
+        .route(
             "/admin/api/accounts/{id}/enable",
             axum::routing::post(underclass::ui::enable_account),
         )
@@ -601,12 +677,12 @@ async fn spawn_app(
         .layer(axum::middleware::from_fn(
             underclass::correlation::middleware,
         ))
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (format!("http://{addr}"), logs)
+    (format!("http://{addr}"), state)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -896,7 +972,11 @@ async fn e2e_full_pool_story() {
 
     // phase 5: cooldown expiry restores the pool automatically
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-    mock.lock().unwrap().failing.clear();
+    {
+        let mut mock = mock.lock().unwrap();
+        mock.failing.remove("tok-acc-1");
+        mock.failing.remove("cop-acc-2");
+    }
     let r6 = post(Some("sess-d"), true).await;
     assert_eq!(
         r6.status(),
@@ -1093,7 +1173,6 @@ async fn e2e_forbidden_403_refreshes_instead_of_bricking_account() {
     store.set_catalog(BackendId::Codex, &[m.clone()]);
     store.set_catalog(BackendId::Copilot, &[m]);
     store.upsert_account(&copilot_account("cop-403", "cop-403-token"));
-    store.upsert_account(&copilot_account("cop-spare", "cop-spare-token"));
     mock.lock()
         .unwrap()
         .forbidden
@@ -1117,12 +1196,557 @@ async fn e2e_forbidden_403_refreshes_instead_of_bricking_account() {
     assert_eq!(
         store.get_account("cop-403").unwrap().status,
         AccountStatus::Healthy,
-        "a 403 that survives one token refresh must not mark the account auth_error"
+        "a 403 cleared by one token refresh must not mark the account auth_error"
     );
     assert_eq!(
         mock.lock().unwrap().forbidden.get("cop-403-token"),
         Some(&0)
     );
+    let rows = wait_for_rows(&store, 2).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.iter().map(|row| row.status).collect::<BTreeSet<_>>(),
+        BTreeSet::from([200, 403])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_auth_retry_uses_rotated_store_credentials() {
+    let mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Copilot, &[model("m")]);
+    store.upsert_account(&copilot_account("cop-rotated", "cop-rotated-old"));
+    {
+        let mut mock = mock.lock().unwrap();
+        mock.forbidden.insert("cop-rotated-old".into(), 2);
+        mock.rotate_on_forbidden.insert(
+            "cop-rotated-old".into(),
+            (
+                store.clone(),
+                "cop-rotated".into(),
+                "cop-rotated-new".into(),
+            ),
+        );
+    }
+    let (base, _) = spawn_app(store.clone(), 400).await;
+    let response = post_model(&base, "m", None).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["account"],
+        "cop-rotated-new"
+    );
+    assert_eq!(mock.lock().unwrap().forbidden["cop-rotated-old"], 1);
+    let rows = wait_for_rows(&store, 2).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        store.get_account("cop-rotated").unwrap().status,
+        AccountStatus::Healthy
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_auth_retry_stops_after_second_forbidden() {
+    let mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Copilot, &[model("m")]);
+    store.upsert_account(&copilot_account("cop-rejected", "cop-rejected-token"));
+    mock.lock()
+        .unwrap()
+        .forbidden
+        .insert("cop-rejected-token".into(), 3);
+    let (base, _) = spawn_app(store.clone(), 400).await;
+    let response = post_model(&base, "m", None).await;
+    assert_eq!(response.status(), 403);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("credential rejected")
+    );
+    assert_eq!(mock.lock().unwrap().forbidden["cop-rejected-token"], 1);
+    assert_eq!(
+        store.get_account("cop-rejected").unwrap().status,
+        AccountStatus::AuthError
+    );
+    assert_eq!(wait_for_rows(&store, 2).await.len(), 2);
+}
+
+async fn post_model(base: &str, model: &str, sticky: Option<&str>) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{base}/v1/responses"))
+        .header("Authorization", "Bearer test-key")
+        .json(&serde_json::json!({"model": model, "input": "hi", "prompt_cache_key": sticky}))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_http_500_tries_healthy_spare_including_sticky_sessions() {
+    let mock = mock_upstream();
+    for sticky in [None, Some("sticky-500")] {
+        let store = Arc::new(Store::in_memory().unwrap());
+        store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+        let primary = if sticky.is_some() {
+            "tok-500-sticky"
+        } else {
+            "tok-500-fresh"
+        };
+        store.upsert_account(&codex_account("primary-a", primary));
+        store.upsert_account(&codex_account("spare-b", "tok-500-spare"));
+        let (base, _) = spawn_app(store.clone(), 400).await;
+        if sticky.is_some() {
+            let warm = post_model(&base, "gpt-5.5", sticky).await;
+            assert_eq!(warm.status(), 200);
+            assert_eq!(
+                warm.json::<serde_json::Value>().await.unwrap()["account"],
+                primary
+            );
+            wait_for_rows(&store, 1).await;
+        }
+        mock.lock().unwrap().server_errors.insert(primary.into());
+        let response = post_model(&base, "gpt-5.5", sticky).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["account"],
+            "tok-500-spare"
+        );
+        let rows = wait_for_rows(&store, if sticky.is_some() { 3 } else { 2 }).await;
+        let failed: Vec<_> = rows.iter().filter(|row| row.status == 500).collect();
+        assert_eq!(
+            failed.len(),
+            1,
+            "a failed primary must not consume the spare's attempt"
+        );
+        assert_eq!(failed[0].account_id, "primary-a");
+        let retry = rows.iter().find(|row| row.account_id == "spare-b").unwrap();
+        assert_eq!(retry.request_id, failed[0].request_id);
+        assert_eq!(
+            store.get_account("primary-a").unwrap().status,
+            AccountStatus::Healthy
+        );
+        if sticky.is_some() {
+            let next = post_model(&base, "gpt-5.5", sticky).await;
+            assert_eq!(
+                next.json::<serde_json::Value>().await.unwrap()["account"],
+                "tok-500-spare"
+            );
+        }
+        mock.lock().unwrap().server_errors.remove(primary);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_nonquota_failure_is_not_erased_by_later_quota_and_unrelated_accounts() {
+    let mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+    store.upsert_account(&codex_account("a-transient", "tok-mixed-500"));
+    store.upsert_account(&codex_account("b-quota", "tok-mixed-quota"));
+    store.upsert_account(&copilot_account("unrelated-copilot", "tok-unused-copilot"));
+    {
+        let mut mock = mock.lock().unwrap();
+        mock.server_errors.insert("tok-mixed-500".into());
+        mock.failing.insert("tok-mixed-quota".into());
+    }
+    let (base, _) = spawn_app(store.clone(), 3_600_000).await;
+    let response = post_model(&base, "gpt-5.5", None).await;
+    let body: serde_json::Value = response.json().await.unwrap();
+    {
+        let mut mock = mock.lock().unwrap();
+        mock.server_errors.remove("tok-mixed-500");
+        mock.failing.remove("tok-mixed-quota");
+    }
+    assert_eq!(body["error"]["code"], "usage_limit_reached");
+    assert_eq!(
+        store.get_account("a-transient").unwrap().status,
+        AccountStatus::Healthy
+    );
+    let rows = wait_for_rows(&store, 2).await;
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.account_id == "a-transient")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_network_failure_is_pool_exhausted_not_quota_or_missing_configuration() {
+    let mock = mock_upstream();
+    for cooling_spare in [false, true] {
+        let store = Arc::new(Store::in_memory().unwrap());
+        store.set_catalog(BackendId::Copilot, &[model("m")]);
+        let token = if cooling_spare {
+            "tok-network-cooling"
+        } else {
+            "tok-network-unrelated"
+        };
+        store.upsert_account(&copilot_account("a-network", token));
+        if cooling_spare {
+            store.set_catalog(BackendId::Codex, &[model("m")]);
+            let mut spare = codex_account("b-cooling", "tok-unused-cooling");
+            spare.status = AccountStatus::Cooling;
+            spare.reset_at = now_ms() + 3_600_000;
+            store.upsert_account(&spare);
+        } else {
+            store.upsert_account(&codex_account("unrelated-codex", "tok-unused-codex"));
+        }
+        let gate = Arc::new(ResponseGate::default());
+        mock.lock()
+            .unwrap()
+            .gates
+            .insert(token.into(), gate.clone());
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let resets = Arc::new(underclass::resets::ResetManager::new(
+            reqwest::Client::new(),
+            "http://127.0.0.1:1".into(),
+            false,
+        ));
+        let (base, _) = spawn_app_with_resets(store.clone(), 3_600_000, resets, client).await;
+        let response = post_model(&base, "m", None).await;
+        gate.release.notify_one();
+        assert_eq!(response.status(), 503);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["error"]["type"],
+            "pool_exhausted"
+        );
+        assert_eq!(
+            store.get_account("a-network").unwrap().status,
+            AccountStatus::Healthy
+        );
+        assert_eq!(wait_for_rows(&store, 1).await[0].status, 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_auth_retry_honors_disable_after_the_first_attempt() {
+    let mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Copilot, &[model("m")]);
+    store.upsert_account(&copilot_account("revoked-retry", "tok-revoked-retry"));
+    let resets = Arc::new(underclass::resets::ResetManager::new(
+        reqwest::Client::new(),
+        "http://127.0.0.1:1".into(),
+        false,
+    ));
+    let (base, state) =
+        spawn_app_with_resets(store.clone(), 400, resets, reqwest::Client::new()).await;
+    {
+        let mut mock = mock.lock().unwrap();
+        mock.forbidden.insert("tok-revoked-retry".into(), 1);
+        mock.disable_on_forbidden.insert(
+            "tok-revoked-retry".into(),
+            (state.clone(), "revoked-retry".into()),
+        );
+    }
+    let response = post_model(&base, "m", None).await;
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        store.get_account("revoked-retry").unwrap().status,
+        AccountStatus::Disabled
+    );
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, 403);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_codex_unsupported_model_preserves_400_and_other_models() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-6-astra"), model("gpt-5.5")]);
+    store.upsert_account(&codex_account("unsupported-a", "tok-unsupported-a"));
+    store.upsert_account(&codex_account("unsupported-b", "tok-unsupported-b"));
+    let (base, _) = spawn_app(store.clone(), 400).await;
+    let response = post_model(&base, "gpt-6-astra", Some("unsupported-session")).await;
+    assert_eq!(response.status(), 400);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("model is not supported")
+    );
+    let rows = wait_for_rows(&store, 2).await;
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.account_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["unsupported-a", "unsupported-b"])
+    );
+    assert!(rows.iter().all(|row| row.status == 400));
+    let response = post_model(&base, "gpt-5.5", Some("unsupported-session")).await;
+    assert_eq!(response.status(), 200);
+    response.text().await.unwrap();
+    let response = post_model(&base, "gpt-6-astra", None).await;
+    assert_eq!(
+        response.status(),
+        429,
+        "only the refused model remains cooling"
+    );
+    assert!(
+        store
+            .list_accounts()
+            .iter()
+            .all(|account| account.status == AccountStatus::Healthy)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_codex_unsupported_model_tries_a_serving_account() {
+    mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-6-astra")]);
+    store.upsert_account(&codex_account("unsupported-first", "tok-unsupported-first"));
+    store.upsert_account(&codex_account("working-second", "tok-working-second"));
+    let (base, _) = spawn_app(store.clone(), 400).await;
+    let response = post_model(&base, "gpt-6-astra", None).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["account"],
+        "tok-working-second"
+    );
+    let rows = wait_for_rows(&store, 2).await;
+    assert_eq!(
+        rows.iter().map(|row| row.status).collect::<BTreeSet<_>>(),
+        BTreeSet::from([200, 400])
+    );
+}
+
+async fn post_claude(base: &str, model: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .header("Authorization", "Bearer test-key")
+        .header("x-app", "cli")
+        .header("user-agent", "claude-cli/2.1.304 (external, sdk-cli)")
+        .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219")
+        .json(&serde_json::json!({
+            "model": model,
+            "max_tokens": 16,
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.304.c61; cc_entrypoint=sdk-cli;"},
+                {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send().await.unwrap()
+}
+
+#[derive(Default)]
+struct ResetFixture {
+    usage_reads: std::sync::atomic::AtomicUsize,
+    consumed: std::sync::atomic::AtomicUsize,
+}
+
+async fn local_reset_fixture() -> (String, Arc<ResetFixture>) {
+    async fn usage(State(state): State<Arc<ResetFixture>>) -> axum::Json<serde_json::Value> {
+        use std::sync::atomic::Ordering::SeqCst;
+        state.usage_reads.fetch_add(1, SeqCst);
+        let allowed = state.consumed.load(SeqCst) > 0;
+        axum::Json(serde_json::json!({
+            "rate_limit": {
+                "allowed": allowed,
+                "limit_reached": !allowed,
+                "primary_window": {
+                    "used_percent": if allowed { 10 } else { 100 },
+                    "reset_at": now_ms() / 1000 + 86400,
+                    "limit_window_seconds": 604800
+                }
+            },
+            "rate_limit_reset_credits": {"available_count": if allowed { 0 } else { 1 }}
+        }))
+    }
+    async fn credits() -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({"credits": [{
+            "id": "local-credit", "reset_type": "codex_rate_limits", "status": "available"
+        }]}))
+    }
+    async fn consume(State(state): State<Arc<ResetFixture>>) -> axum::Json<serde_json::Value> {
+        state
+            .consumed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        axum::Json(serde_json::json!({"code": "reset"}))
+    }
+    let state = Arc::new(ResetFixture::default());
+    let app = axum::Router::new()
+        .route("/wham/usage", axum::routing::get(usage))
+        .route(
+            "/wham/rate-limit-reset-credits",
+            axum::routing::get(credits),
+        )
+        .route(
+            "/wham/rate-limit-reset-credits/consume",
+            axum::routing::post(consume),
+        )
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), state)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_non_codex_requests_never_spend_codex_reset_credits() {
+    use std::sync::atomic::Ordering::SeqCst;
+    mock_upstream();
+    for claude_status in [AccountStatus::Healthy, AccountStatus::Cooling] {
+        let store = Arc::new(Store::in_memory().unwrap());
+        store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+        store.set_catalog(BackendId::Copilot, &[model("copilot-only")]);
+        let mut codex = codex_account("reset-codex", "tok-reset-codex");
+        codex.status = AccountStatus::Cooling;
+        codex.reset_at = now_ms() + 3_600_000;
+        store.upsert_account(&codex);
+        let mut claude = account("reset-claude", BackendId::Claude, "claude-reset-gate");
+        claude.status = claude_status;
+        claude.reset_at = if claude_status == AccountStatus::Cooling {
+            now_ms() + 3_600_000
+        } else {
+            0
+        };
+        store.upsert_account(&claude);
+        store.upsert_account(&copilot_account("reset-copilot", "cop-reset-gate"));
+        let (reset_url, fixture) = local_reset_fixture().await;
+        let resets = Arc::new(underclass::resets::ResetManager::new(
+            reqwest::Client::new(),
+            reset_url,
+            true,
+        ));
+        let (base, _) =
+            spawn_app_with_resets(store.clone(), 400, resets, reqwest::Client::new()).await;
+
+        let response = post_claude(&base, "claude-haiku-5-5").await;
+        assert_eq!(
+            response.status().as_u16(),
+            if claude_status == AccountStatus::Healthy {
+                200
+            } else {
+                429
+            }
+        );
+        response.text().await.unwrap();
+        let response = post_model(&base, "copilot-only", None).await;
+        assert_eq!(response.status(), 200);
+        response.text().await.unwrap();
+        assert_eq!(
+            fixture.usage_reads.load(SeqCst),
+            0,
+            "ineligible requests must not even poll Codex usage"
+        );
+        assert_eq!(fixture.consumed.load(SeqCst), 0);
+        assert_eq!(
+            store.get_account("reset-codex").unwrap().status,
+            AccountStatus::Cooling
+        );
+
+        // Positive control: the same local credit is redeemable by an eligible OpenAI request.
+        let response = post_model(&base, "gpt-5.5", None).await;
+        assert_eq!(response.status(), 200);
+        response.text().await.unwrap();
+        assert_eq!(fixture.consumed.load(SeqCst), 1);
+        assert_eq!(
+            store.get_account("reset-codex").unwrap().status,
+            AccountStatus::Healthy
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_inflight_quota_preserves_operator_disable() {
+    let mock = mock_upstream();
+    for backend in [BackendId::Codex, BackendId::Claude] {
+        let store = Arc::new(Store::in_memory().unwrap());
+        let token = if backend == BackendId::Codex {
+            "tok-late-quota-disabled"
+        } else {
+            "claude-late-window-disabled"
+        };
+        let model_id = if backend == BackendId::Codex {
+            "gpt-5.5"
+        } else {
+            "claude-haiku-5-5"
+        };
+        store.set_catalog(backend, &[model(model_id)]);
+        store.upsert_account(&account("late-disabled", backend, token));
+        let gate = Arc::new(ResponseGate::default());
+        {
+            let mut mock = mock.lock().unwrap();
+            mock.gates.insert(token.into(), gate.clone());
+        }
+        let resets = Arc::new(underclass::resets::ResetManager::new(
+            reqwest::Client::new(),
+            "http://127.0.0.1:1".into(),
+            false,
+        ));
+        let (base, state) =
+            spawn_app_with_resets(store.clone(), 400, resets, reqwest::Client::new()).await;
+        let pending_base = base.clone();
+        let pending = tokio::spawn(async move {
+            let response = if backend == BackendId::Codex {
+                post_model(&pending_base, model_id, None).await
+            } else {
+                post_claude(&pending_base, model_id).await
+            };
+            let status = response.status();
+            response.text().await.unwrap();
+            status
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        let disabled = reqwest::Client::new()
+            .post(format!("{base}/admin/api/accounts/late-disabled/disable"))
+            .header("Authorization", "Bearer unused")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), 204);
+        assert_eq!(
+            store.get_account("late-disabled").unwrap().status,
+            AccountStatus::Disabled
+        );
+        gate.release.notify_one();
+        let status = pending.await.unwrap();
+        assert_eq!(
+            status.as_u16(),
+            if backend == BackendId::Codex {
+                429
+            } else {
+                200
+            }
+        );
+        assert_eq!(
+            store.get_account("late-disabled").unwrap().status,
+            AccountStatus::Disabled
+        );
+        {
+            let mut pool = state.pool.lock().unwrap();
+            assert_eq!(
+                pool.account("late-disabled").unwrap().status,
+                AccountStatus::Disabled
+            );
+            pool.sweep(now_ms() + 7_200_000);
+            assert_eq!(
+                pool.account("late-disabled").unwrap().status,
+                AccountStatus::Disabled
+            );
+        }
+        let response = if backend == BackendId::Codex {
+            post_model(&base, model_id, None).await
+        } else {
+            post_claude(&base, model_id).await
+        };
+        assert_eq!(
+            response.status(),
+            503,
+            "late quota must not readmit a disabled subscription"
+        );
+    }
 }
 
 /// `enable` is the operator's recovery lever. It must clear a stranded `auth_error` account, and it

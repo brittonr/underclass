@@ -611,7 +611,7 @@ async function useReset(id, force = false) {
   const data = await res.json().catch(() => ({}));
   if (res.ok) {
     alert(`Reset outcome: ${data.outcome}. ${data.label} is now ${data.status}; ${data.available_resets} reset(s) remaining.`);
-  } else if ((data.error === 'not_rate_limited' || data.error === 'already_redeemed') && confirm(data.message + '\n\nRedeem anyway?')) {
+  } else if (!force && (data.error === 'not_rate_limited' || data.error === 'already_redeemed') && confirm(data.message + '\n\nRedeem anyway?')) {
     return useReset(id, true);
   } else {
     alert('Reset failed: ' + (data.message || data.error || res.status));

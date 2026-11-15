@@ -851,6 +851,21 @@ impl Store {
         .expect("upsert account");
     }
 
+    /// @cc [owner:ghuntley,label:persistence] plan-observation-metadata-only
+    /// A plan observation MUST update only plan metadata on an existing account. It MUST NOT
+    /// recreate a removed row, overwrite credentials, or undo a newer status or cooldown.
+    pub fn update_account_plan(&self, id: &str, plan: &str) -> bool {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE accounts SET plan = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, plan, crate::models::now_ms()],
+            )
+            .expect("update account plan")
+            != 0
+    }
+
     pub fn delete_account(&self, id: &str) {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM accounts WHERE id = ?1", params![id])
@@ -1088,6 +1103,35 @@ fn parse_status(s: &str) -> AccountStatus {
 #[cfg(test)]
 mod tests {
     use super::{Store, UsageQuery, UsageRecord};
+
+    #[test]
+    fn plan_observation_preserves_rotated_credentials_and_deleted_accounts() {
+        let store = Store::in_memory().unwrap();
+        let account = crate::flows::new_account(
+            crate::models::BackendId::Claude,
+            "owner@example.test".into(),
+        );
+        store.upsert_account(&account);
+        store.update_tokens(
+            &account.id,
+            Some("rotated-refresh"),
+            Some("rotated-access"),
+            10_000,
+            None,
+            None,
+        );
+        store.update_account_status(&account.id, crate::models::AccountStatus::Disabled, 0);
+        assert!(store.update_account_plan(&account.id, "max"));
+        let updated = store.get_account(&account.id).unwrap();
+        assert_eq!(updated.status, crate::models::AccountStatus::Disabled);
+        assert_eq!(updated.refresh_token.as_deref(), Some("rotated-refresh"));
+        assert_eq!(updated.access_token.as_deref(), Some("rotated-access"));
+        assert_eq!(updated.expires_at, 10_000);
+        assert_eq!(updated.plan.as_deref(), Some("max"));
+        store.delete_account(&account.id);
+        assert!(!store.update_account_plan(&account.id, "pro"));
+        assert!(store.get_account(&account.id).is_none());
+    }
 
     /// A store created before `token_refreshed_at` existed must gain the column on open, keep its
     /// rows, and default the new column to 0 so the account reads back rather than erroring.

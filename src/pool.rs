@@ -45,6 +45,8 @@ pub struct PoolCore {
     /// Per-account, per-model cooldowns: the upstream refused this model on this account while
     /// the account keeps serving its other models.
     model_cooldowns: HashMap<String, HashMap<String, i64>>,
+    /// Separately observed family windows, keyed by a backend-provided model prefix.
+    model_family_cooldowns: HashMap<String, HashMap<String, i64>>,
 }
 
 impl PoolCore {
@@ -58,6 +60,7 @@ impl PoolCore {
             catalog: HashMap::new(),
             surfaces,
             model_cooldowns: HashMap::new(),
+            model_family_cooldowns: HashMap::new(),
         };
         for a in store.list_accounts() {
             core.accounts.insert(
@@ -86,6 +89,21 @@ impl PoolCore {
         self.catalog
             .get(&backend)
             .is_some_and(|set| set.contains(model))
+    }
+
+    /// @cc [owner:ghuntley,label:pool] backend-request-eligibility
+    /// `backend_eligible` MUST use the requested model and surface, including the existing
+    /// unknown-model fallback, without consulting account health or spending a reset credit.
+    pub fn backend_eligible(&self, backend: BackendId, model: &str, surface: Surface) -> bool {
+        if !self.serves_surface(backend, surface) {
+            return false;
+        }
+        if self.serves(backend, model) {
+            return true;
+        }
+        !BackendId::all().into_iter().any(|candidate| {
+            self.serves_surface(candidate, surface) && self.serves(candidate, model)
+        }) && self.fallback_backend(surface) == Some(backend)
     }
 
     fn eligible_backends(&self, model: &str, surface: Surface) -> Vec<BackendId> {
@@ -131,20 +149,11 @@ impl PoolCore {
                 readmitted.push(state.account.id.clone());
             }
         }
-        let expired: Vec<String> = self
-            .model_cooldowns
-            .iter_mut()
-            .filter_map(|(account_id, models)| {
+        for cooldowns in [&mut self.model_cooldowns, &mut self.model_family_cooldowns] {
+            cooldowns.retain(|_, models| {
                 models.retain(|_, until_ms| *until_ms > now);
-                if models.is_empty() {
-                    Some(account_id.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for account_id in expired {
-            self.model_cooldowns.remove(&account_id);
+                !models.is_empty()
+            });
         }
         loop {
             let expired = match self.bindings.peek_lru() {
@@ -164,8 +173,17 @@ impl PoolCore {
     /// @cc [owner:ghuntley,label:pool] model-cooldown-scopes-one-model
     /// `report_model_quota` MUST record a cooldown for one model on one account until
     /// `until_ms`, MUST NOT change the account's status, and MUST never shorten an existing
-    /// cooldown for the same account and model.
+    /// cooldown for the same account and model. Missing, Disabled and AuthError accounts MUST
+    /// remain untouched by a late quota response.
     pub fn report_model_quota(&mut self, account_id: &str, model: &str, until_ms: i64) {
+        if !self.accounts.get(account_id).is_some_and(|state| {
+            matches!(
+                state.account.status,
+                AccountStatus::Healthy | AccountStatus::Cooling
+            )
+        }) {
+            return;
+        }
         let models = self
             .model_cooldowns
             .entry(account_id.to_string())
@@ -176,12 +194,54 @@ impl PoolCore {
         }
     }
 
+    /// @cc [owner:ghuntley,label:pool] family-quota-stays-model-scoped
+    /// A family quota MUST block only names with the supplied prefix on this account, MUST
+    /// never shorten its existing family deadline, and MUST leave protected account states
+    /// and exact-model cooldowns unchanged.
+    pub fn report_model_family_quota(&mut self, account_id: &str, prefix: &str, until_ms: i64) {
+        if !self.accounts.get(account_id).is_some_and(|state| {
+            matches!(
+                state.account.status,
+                AccountStatus::Healthy | AccountStatus::Cooling
+            )
+        }) {
+            return;
+        }
+        let deadline = self
+            .model_family_cooldowns
+            .entry(account_id.to_string())
+            .or_default()
+            .entry(prefix.to_string())
+            .or_insert(until_ms);
+        *deadline = (*deadline).max(until_ms);
+    }
+
+    /// Clearing an observed family window MUST NOT erase independently refused exact models.
+    pub fn clear_model_family_quota(&mut self, account_id: &str, prefix: &str) {
+        if let Some(families) = self.model_family_cooldowns.get_mut(account_id) {
+            families.remove(prefix);
+            if families.is_empty() {
+                self.model_family_cooldowns.remove(account_id);
+            }
+        }
+    }
+
     /// Whether the account is cooling for the given model.
     pub fn model_cooling_until(&self, account_id: &str, model: &str) -> Option<i64> {
-        self.model_cooldowns
+        let exact = self
+            .model_cooldowns
             .get(account_id)
             .and_then(|models| models.get(model))
-            .copied()
+            .copied();
+        let family = self
+            .model_family_cooldowns
+            .get(account_id)
+            .into_iter()
+            .flat_map(|families| families.iter())
+            .filter(|(prefix, _)| model.starts_with(prefix.as_str()))
+            .map(|(_, until)| *until)
+            .max();
+        exact.into_iter().chain(family).max()
     }
 
     /// @cc [owner:ghuntley,label:pool] select-sticky-healthy-never-unhealthy
@@ -230,11 +290,9 @@ impl PoolCore {
                         && s.account.healthy()
                         && backends.contains(&s.account.backend)
                         && backend_filter.is_none_or(|b| s.account.backend == b)
-                        && !core
-                            .model_cooldowns
-                            .get(*id)
-                            .and_then(|models| models.get(model))
-                            .is_some_and(|until_ms| *until_ms > now)
+                        && core
+                            .model_cooling_until(id, model)
+                            .is_none_or(|until_ms| until_ms <= now)
                 })
                 .map(|(id, s)| (s.inflight, id))
                 .collect();
@@ -302,24 +360,24 @@ impl PoolCore {
 
     /// The earliest moment an eligible account can serve the model again.
     fn min_reset(&self, eligible: impl Fn(&Account) -> bool, model: &str, now: i64) -> Option<i64> {
-        let mut deadlines: Vec<i64> = self
-            .accounts
+        self.accounts
             .values()
-            .filter(|s| s.account.status == AccountStatus::Cooling && eligible(&s.account))
-            .map(|s| s.account.reset_at)
-            .collect();
-        deadlines.extend(
-            self.model_cooldowns
-                .iter()
-                .filter(|(id, _)| {
-                    self.accounts
-                        .get(*id)
-                        .is_some_and(|state| eligible(&state.account))
-                })
-                .filter_map(|(_, models)| models.get(model).copied())
-                .filter(|until_ms| *until_ms > now),
-        );
-        deadlines.into_iter().min()
+            .filter(|state| eligible(&state.account))
+            .filter_map(|state| {
+                let model_until = self
+                    .model_cooling_until(&state.account.id, model)
+                    .filter(|until| *until > now);
+                match state.account.status {
+                    AccountStatus::Cooling => Some(
+                        model_until
+                            .unwrap_or(state.account.reset_at)
+                            .max(state.account.reset_at),
+                    ),
+                    AccountStatus::Healthy => model_until,
+                    AccountStatus::Disabled | AccountStatus::AuthError => None,
+                }
+            })
+            .min()
     }
 
     fn bind(&mut self, key: &str, account_id: &str, now: i64) {
@@ -358,18 +416,29 @@ impl PoolCore {
     }
 
     /// @cc [owner:ghuntley,label:pool] report-quota-transitions
-    /// `report` MUST transition the account to `Cooling { reset_at = until_ms }` on
-    /// `Outcome::QuotaExhausted` and to `AuthError` on `Outcome::AuthFailed`, and MUST NOT change
-    /// the account's status on `Outcome::Ok`, `Outcome::Transient`, or a model-scoped quota
-    /// rejection.
+    /// `report` MUST preserve Disabled and AuthError states. Otherwise quota exhaustion MUST
+    /// cool the account without shortening an existing deadline, and authentication failure
+    /// MUST mark it AuthError. Success, transient and model-scoped outcomes MUST NOT change
+    /// status. A missing account MUST NOT be recreated.
     pub fn report(&mut self, account_id: &str, outcome: Outcome) -> Option<AccountStatus> {
         let state = self.accounts.get_mut(account_id)?;
+        if matches!(
+            state.account.status,
+            AccountStatus::Disabled | AccountStatus::AuthError
+        ) {
+            return None;
+        }
         let new_status = match outcome {
-            Outcome::QuotaExhausted { until_ms } => Some((AccountStatus::Cooling, until_ms)),
+            Outcome::QuotaExhausted { until_ms } => {
+                Some((AccountStatus::Cooling, until_ms.max(state.account.reset_at)))
+            }
             Outcome::AuthFailed => Some((AccountStatus::AuthError, 0)),
             Outcome::Transient | Outcome::Ok | Outcome::ModelQuotaExhausted { .. } => None,
         };
         if let Some((status, reset_at)) = new_status {
+            if state.account.status == status && state.account.reset_at == reset_at {
+                return None;
+            }
             state.account.status = status;
             state.account.reset_at = reset_at;
             Some(status)
@@ -382,6 +451,13 @@ impl PoolCore {
         if let Some(s) = self.accounts.get_mut(account_id) {
             s.account.status = status;
             s.account.reset_at = reset_at;
+        }
+    }
+
+    /// Update only plan metadata; deleted accounts MUST remain absent.
+    pub fn set_plan(&mut self, account_id: &str, plan: String) {
+        if let Some(state) = self.accounts.get_mut(account_id) {
+            state.account.plan = Some(plan);
         }
     }
 
@@ -431,6 +507,8 @@ impl PoolCore {
 
     pub fn remove_account(&mut self, account_id: &str) {
         self.accounts.remove(account_id);
+        self.model_cooldowns.remove(account_id);
+        self.model_family_cooldowns.remove(account_id);
         let keys: Vec<String> = self
             .bindings
             .iter()
@@ -682,5 +760,63 @@ mod tests {
             core.select(0, None, "gpt-5.5", Surface::OpenAI),
             Err(SelectError::Saturated { until_ms: 10_000 })
         ));
+    }
+
+    #[test]
+    fn late_outcomes_preserve_operator_and_authentication_blocks() {
+        for status in [AccountStatus::Disabled, AccountStatus::AuthError] {
+            let mut core = core_with(&[(BackendId::Codex, &["gpt-5.5"], &["a"])]);
+            core.set_status("a", status, 0);
+            assert_eq!(
+                core.report("a", Outcome::QuotaExhausted { until_ms: 100 }),
+                None
+            );
+            assert_eq!(core.report("a", Outcome::AuthFailed), None);
+            core.sweep(101);
+            assert_eq!(core.account("a").unwrap().status, status);
+            assert!(matches!(
+                core.select(101, None, "gpt-5.5", Surface::OpenAI),
+                Err(SelectError::NoAccounts)
+            ));
+        }
+    }
+
+    #[test]
+    fn family_recovery_keeps_independent_model_refusals() {
+        let mut core = core_with(&[(
+            BackendId::Claude,
+            &["claude-fable-5", "claude-fable-5-1", "claude-haiku-5-5"],
+            &["a"],
+        )]);
+        core.report_model_family_quota("a", "claude-fable-", 100);
+        core.report_model_quota("a", "claude-fable-5", 200);
+        assert!(matches!(
+            core.select(0, None, "claude-fable-5", Surface::Anthropic),
+            Err(SelectError::Saturated { until_ms: 200 })
+        ));
+        assert!(matches!(
+            core.select(0, None, "claude-fable-future", Surface::Anthropic),
+            Err(SelectError::Saturated { until_ms: 100 })
+        ));
+        assert_eq!(
+            core.select(0, None, "claude-haiku-5-5", Surface::Anthropic)
+                .unwrap()
+                .account_id,
+            "a"
+        );
+        core.clear_model_family_quota("a", "claude-fable-");
+        assert!(
+            core.select(1, None, "claude-fable-5-1", Surface::Anthropic)
+                .is_ok()
+        );
+        assert!(matches!(
+            core.select(1, None, "claude-fable-5", Surface::Anthropic),
+            Err(SelectError::Saturated { until_ms: 200 })
+        ));
+        core.sweep(200);
+        assert!(
+            core.select(200, None, "claude-fable-5", Surface::Anthropic)
+                .is_ok()
+        );
     }
 }

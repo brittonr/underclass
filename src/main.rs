@@ -571,46 +571,78 @@ async fn refresh_opencode_go_catalog_on_boot(state: &Arc<proxy::AppState>) {
 }
 
 /// @cc [owner:ghuntley,label:pool] claude-usage-readmission
-/// A fresh Claude usage snapshot MUST readmit a Cooling account only when at least one window
-/// reports utilization below 100% and every reported window has valid headroom. Exhausted or
-/// unknown usage MUST NOT clear a cooldown; a future exhausted-window deadline MAY extend it
-/// but MUST NOT shorten it. Other account statuses MUST NOT be readmitted by usage polling.
+/// A fresh Claude usage snapshot MUST readmit a Cooling account only with valid shared
+/// headroom. Only Healthy/Cooling accounts MAY enter or extend Cooling, using the latest
+/// future exhausted shared reset without shortening an existing cooldown. Disabled/AuthError
+/// states MUST remain untouched; family windows MUST NOT affect account status.
 fn claude_quota_transition(
     status: models::AccountStatus,
     reset_at: i64,
     snapshot: &claude::UsageSnapshot,
     now: i64,
 ) -> Option<(models::AccountStatus, i64)> {
+    if !matches!(
+        status,
+        models::AccountStatus::Healthy | models::AccountStatus::Cooling
+    ) {
+        return None;
+    }
     if let Some(until) = snapshot.exhausted_reset_ms()
         && until > now
-        && until > reset_at
+        && (status == models::AccountStatus::Healthy || until > reset_at)
     {
         return Some((models::AccountStatus::Cooling, until));
     }
     if status != models::AccountStatus::Cooling {
         return None;
     }
-    let mut observed = false;
-    for utilization in [
-        snapshot.five_hour.utilization,
-        snapshot.seven_day.utilization,
-        snapshot.seven_day_fable.utilization,
-    ] {
-        let Some(used) = utilization else {
-            continue;
-        };
-        if !(0.0..1.0).contains(&used) {
+    snapshot
+        .shared_headroom()
+        .then_some((models::AccountStatus::Healthy, 0))
+}
+
+/// @cc [owner:ghuntley,label:persistence] claude-poll-reconciliation-atomic
+/// Late observations MUST NOT recreate removed accounts or replace credentials/operator state.
+/// Plan updates MUST update existing metadata only. Status changes MUST hold pool -> store
+/// locks through persistence, with observations published only after policy reconciliation and
+/// while deletion is excluded by the pool lock.
+fn reconcile_claude_usage(
+    state: &proxy::AppState,
+    account_id: &str,
+    snapshot: &claude::UsageSnapshot,
+    now: i64,
+) -> Option<(models::AccountStatus, i64)> {
+    let mut core = state.pool.lock().unwrap();
+    let current = core.account(account_id)?;
+    let next = claude_quota_transition(current.status, current.reset_at, snapshot, now);
+    if let Some(plan) = snapshot.plan.as_deref()
+        && current.plan.as_deref() != Some(plan)
+    {
+        if !state.store.update_account_plan(account_id, plan) {
             return None;
         }
-        observed = true;
+        core.set_plan(account_id, plan.to_owned());
     }
-    observed.then_some((models::AccountStatus::Healthy, 0))
+    claude::reconcile_family_quota(&mut core, account_id, snapshot, now);
+    if let Some((status, reset_at)) = next {
+        core.set_status(account_id, status, reset_at);
+        state
+            .store
+            .update_account_status(account_id, status, reset_at);
+    }
+    state
+        .observations
+        .lock()
+        .unwrap()
+        .insert(account_id.to_owned(), claude::usage_view(snapshot));
+    next
 }
 
 /// @cc [owner:ghuntley,label:pool] claude-poll-persists-quota-recovery
 /// `poll_claude_usage` MUST update the in-memory pool and SQLite status together when a
 /// successfully fetched usage snapshot changes an account's quota state. A failed usage fetch
-/// MUST leave the account status unchanged and MUST NOT redeem any reset credit.
+/// MUST leave the account status unchanged and MUST NOT redeem any reset credit. Fable quota
+/// MUST cool only the `claude-fable-` family, independently of exact-model HTTP cooldowns.
 /// Polls each Claude account's own usage API for its plan, quota windows, and banked reset
 /// credits, and reconciles its cooldown with those windows.
 ///
@@ -649,37 +681,10 @@ async fn poll_claude_usage(state: &Arc<proxy::AppState>) {
                 continue;
             }
         };
-        state
-            .observations
-            .lock()
-            .unwrap()
-            .insert(account.id.clone(), claude::usage_view(&snapshot));
-        if let Some(plan) = snapshot.plan.clone()
-            && account.plan.as_deref() != Some(plan.as_str())
-        {
-            let mut updated = account.clone();
-            updated.plan = Some(plan);
-            updated.updated_at = models::now_ms();
-            state.store.upsert_account(&updated);
-            state.pool.lock().unwrap().sync_account(updated);
-        }
-        let now = models::now_ms();
-        let transition = {
-            let mut pool = state.pool.lock().unwrap();
-            let next = pool.account(&account.id).and_then(|current| {
-                claude_quota_transition(current.status, current.reset_at, &snapshot, now)
-            });
-            if let Some((status, reset_at)) = next {
-                pool.set_status(&account.id, status, reset_at);
-            }
-            next
-        };
+        let transition = reconcile_claude_usage(state, &account.id, &snapshot, models::now_ms());
         let Some((status, reset_at)) = transition else {
             continue;
         };
-        state
-            .store
-            .update_account_status(&account.id, status, reset_at);
         if status == models::AccountStatus::Healthy {
             logging::log_account_state(
                 &account.id,
@@ -738,11 +743,15 @@ async fn poll_opencode_go_usage(state: &Arc<proxy::AppState>) {
     }
 }
 
-/// Disables accounts on a free plan and re-enables those it disabled once they are upgraded.
+/// @cc [owner:ghuntley,label:pool] plan-gate-operator-serialization
+/// Plan-gate decisions MUST read current account metadata and persist status under the pool
+/// lock, in pool -> store order. Only a disable attributed to the plan gate MAY be reversed;
+/// concurrent operator disable/delete actions MUST NOT be overwritten by a stale decision.
 ///
 /// Codex plans come from the stored access token's claims, which the daily scheduled rotation
 /// keeps current even while the account is disabled.
 fn enforce_plan_gates(state: &Arc<proxy::AppState>) {
+    let mut pool = state.pool.lock().unwrap();
     for account in state.store.list_accounts() {
         let (status, reason, event) = match account.plan_gate() {
             Some(models::PlanGate::Disable) => (
@@ -756,11 +765,7 @@ fn enforce_plan_gates(state: &Arc<proxy::AppState>) {
         let plan = account.plan_label().unwrap_or_default();
         state.store.update_account_status(&account.id, status, 0);
         state.store.set_disabled_reason(&account.id, reason);
-        state
-            .pool
-            .lock()
-            .unwrap()
-            .set_status(&account.id, status, 0);
+        pool.set_status(&account.id, status, 0);
         logging::log_account_state(
             &account.id,
             Some(&account.label),
@@ -863,7 +868,7 @@ mod tests {
     fn fresh_headroom_readmits_stale_claude_cooldown() {
         let mut usage = claude::UsageSnapshot::default();
         usage.seven_day.utilization = Some(0.6);
-        usage.seven_day_fable.utilization = Some(0.84);
+        usage.seven_day_fable.utilization = Some(1.0);
         assert_eq!(
             claude_quota_transition(models::AccountStatus::Cooling, 10_000, &usage, 1_000),
             Some((models::AccountStatus::Healthy, 0))
@@ -910,6 +915,263 @@ mod tests {
             models::AccountStatus::Disabled,
         ] {
             assert_eq!(claude_quota_transition(status, 0, &usage, 1_000), None);
+        }
+    }
+
+    #[test]
+    fn exhausted_usage_does_not_override_operator_or_auth_states() {
+        let usage = claude::parse_usage(
+            &serde_json::json!({
+                "five_hour": {"utilization": 100, "resets_at": "1970-01-01T00:00:20Z"}
+            }),
+            1_000,
+        );
+        for status in [
+            models::AccountStatus::Disabled,
+            models::AccountStatus::AuthError,
+        ] {
+            assert_eq!(claude_quota_transition(status, 0, &usage, 1_000), None);
+        }
+        assert_eq!(
+            claude_quota_transition(models::AccountStatus::Healthy, 0, &usage, 1_000),
+            Some((models::AccountStatus::Cooling, 20_000))
+        );
+    }
+
+    fn claude_usage_state() -> (proxy::AppState, String) {
+        let store = Arc::new(store::Store::in_memory().unwrap());
+        let account = flows::new_account(models::BackendId::Claude, "owner@example.test".into());
+        store.upsert_account(&account);
+        let pool = Arc::new(Mutex::new(pool::PoolCore::new(
+            &store,
+            HashMap::from([(models::BackendId::Claude, vec![models::Surface::Anthropic])]),
+        )));
+        let client = reqwest::Client::new();
+        let state = proxy::AppState {
+            tokens: Arc::new(tokens::TokenManager::new(store.clone(), client.clone())),
+            store,
+            pool,
+            backends: Arc::new(BackendMap::new()),
+            client,
+            logs: Arc::new(Mutex::new(Default::default())),
+            flows: flows::FlowRegistry::default(),
+            proxy_key: None,
+            ui_token: "unused".into(),
+            resets: Arc::new(underclass::resets::ResetManager::new(
+                reqwest::Client::new(),
+                "http://127.0.0.1:1".into(),
+                false,
+            )),
+            stream_usage_unsupported: Mutex::new(Default::default()),
+            observations: Mutex::new(Default::default()),
+            stats_retention_days: 730,
+        };
+        (state, account.id)
+    }
+
+    #[test]
+    fn late_claude_plan_observation_preserves_credentials_and_newer_state() {
+        for status in [
+            models::AccountStatus::Disabled,
+            models::AccountStatus::AuthError,
+            models::AccountStatus::Cooling,
+        ] {
+            let (state, id) = claude_usage_state();
+            let usage = claude::parse_usage(
+                &serde_json::json!({
+                    "plan_type": "max",
+                    "five_hour": {"utilization": 100, "resets_at": "1970-01-01T00:00:20Z"}
+                }),
+                1_000,
+            );
+            // Credentials and status changed while the usage request was in flight.
+            let mut current = state.store.get_account(&id).unwrap();
+            current.status = status;
+            current.reset_at = 30_000;
+            current.access_token = Some("rotated-access".into());
+            current.refresh_token = Some("rotated-refresh".into());
+            current.expires_at = 90_000;
+            current.token_refreshed_at = 900;
+            {
+                let mut core = state.pool.lock().unwrap();
+                core.sync_account(current);
+                state.store.upsert_account(core.account(&id).unwrap());
+            }
+            assert_eq!(reconcile_claude_usage(&state, &id, &usage, 1_000), None);
+            let stored = state.store.get_account(&id).unwrap();
+            let core = state.pool.lock().unwrap();
+            let pooled = core.account(&id).unwrap();
+            for account in [&stored, pooled] {
+                assert_eq!(account.status, status);
+                assert_eq!(account.reset_at, 30_000);
+                assert_eq!(account.plan.as_deref(), Some("max"));
+                assert_eq!(account.access_token.as_deref(), Some("rotated-access"));
+                assert_eq!(account.refresh_token.as_deref(), Some("rotated-refresh"));
+                assert_eq!(account.expires_at, 90_000);
+                assert_eq!(account.token_refreshed_at, 900);
+            }
+        }
+    }
+
+    #[test]
+    fn late_claude_usage_does_not_recreate_deleted_account_or_observation() {
+        let (state, id) = claude_usage_state();
+        let usage = claude::parse_usage(
+            &serde_json::json!({
+                "plan_type": "max", "five_hour": {"utilization": 20}
+            }),
+            1_000,
+        );
+        {
+            let mut core = state.pool.lock().unwrap();
+            state.store.delete_account(&id);
+            core.remove_account(&id);
+        }
+        assert_eq!(reconcile_claude_usage(&state, &id, &usage, 1_000), None);
+        assert!(state.store.get_account(&id).is_none());
+        assert!(state.pool.lock().unwrap().account(&id).is_none());
+        assert!(!state.observations.lock().unwrap().contains_key(&id));
+    }
+
+    #[test]
+    fn claude_poll_requires_valid_reported_shared_headroom_to_persist_recovery() {
+        for (five_hour, expected) in [
+            (serde_json::json!(null), models::AccountStatus::Healthy),
+            (
+                serde_json::json!({"utilization": 0}),
+                models::AccountStatus::Healthy,
+            ),
+            (serde_json::json!({}), models::AccountStatus::Cooling),
+            (
+                serde_json::json!({"utilization": "unknown"}),
+                models::AccountStatus::Cooling,
+            ),
+            (
+                serde_json::json!({"utilization": 100}),
+                models::AccountStatus::Cooling,
+            ),
+        ] {
+            let (state, id) = claude_usage_state();
+            {
+                let mut core = state.pool.lock().unwrap();
+                core.set_status(&id, models::AccountStatus::Cooling, 30_000);
+                state
+                    .store
+                    .update_account_status(&id, models::AccountStatus::Cooling, 30_000);
+            }
+            let usage = claude::parse_usage(
+                &serde_json::json!({
+                    "five_hour": five_hour, "seven_day": {"utilization": 20}
+                }),
+                1_000,
+            );
+            reconcile_claude_usage(&state, &id, &usage, 1_000);
+            assert_eq!(state.store.get_account(&id).unwrap().status, expected);
+            assert_eq!(
+                state.pool.lock().unwrap().account(&id).unwrap().status,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn claude_family_observations_preserve_protected_account_cooldowns() {
+        for status in [
+            models::AccountStatus::Disabled,
+            models::AccountStatus::AuthError,
+        ] {
+            let (state, id) = claude_usage_state();
+            {
+                let mut core = state.pool.lock().unwrap();
+                core.report_model_family_quota(&id, "claude-fable-", 20_000);
+                core.set_status(&id, status, 0);
+                state.store.update_account_status(&id, status, 0);
+            }
+            for used in [20, 100] {
+                let usage = claude::parse_usage(
+                    &serde_json::json!({
+                        "five_hour": {"utilization": 20},
+                        "seven_day_fable": {"utilization": used, "resets_at": "1970-01-01T00:00:30Z"}
+                    }),
+                    1_000,
+                );
+                reconcile_claude_usage(&state, &id, &usage, 1_000);
+                let core = state.pool.lock().unwrap();
+                assert_eq!(
+                    core.model_cooling_until(&id, "claude-fable-5-1"),
+                    Some(20_000)
+                );
+                assert_eq!(core.account(&id).unwrap().status, status);
+            }
+        }
+    }
+
+    #[test]
+    fn claude_family_quota_is_independent_of_account_and_exact_model_cooldowns() {
+        let (state, id) = claude_usage_state();
+        let mut body = serde_json::json!({
+            "five_hour": {"utilization": 10}, "seven_day": {"utilization": 20},
+            "seven_day_fable": {"utilization": 100, "resets_at": "1970-01-01T00:00:20Z"}
+        });
+        {
+            let mut core = state.pool.lock().unwrap();
+            core.set_status(&id, models::AccountStatus::Cooling, 50_000);
+            state
+                .store
+                .update_account_status(&id, models::AccountStatus::Cooling, 50_000);
+            core.report_model_quota(&id, "claude-fable-5-1", 40_000);
+        }
+        let usage = claude::parse_usage(&body, 1_000);
+        assert_eq!(
+            reconcile_claude_usage(&state, &id, &usage, 1_000),
+            Some((models::AccountStatus::Healthy, 0))
+        );
+        {
+            let core = state.pool.lock().unwrap();
+            assert_eq!(
+                core.model_cooling_until(&id, "claude-fable-5-1"),
+                Some(40_000)
+            );
+            assert_eq!(
+                core.model_cooling_until(&id, "claude-fable-5-2"),
+                Some(20_000)
+            );
+            assert_eq!(core.model_cooling_until(&id, "claude-haiku-5-5"), None);
+            assert_eq!(core.model_cooling_until(&id, "claude-fable"), None);
+        }
+        let stored = state.store.get_account(&id).unwrap();
+        assert_eq!(
+            (stored.status, stored.reset_at),
+            (models::AccountStatus::Healthy, 0)
+        );
+        assert!(state.observations.lock().unwrap().contains_key(&id));
+        body["seven_day_fable"]["utilization"] = serde_json::json!("unknown");
+        reconcile_claude_usage(&state, &id, &claude::parse_usage(&body, 1_000), 1_000);
+        assert_eq!(
+            state
+                .pool
+                .lock()
+                .unwrap()
+                .model_cooling_until(&id, "claude-fable-5-2"),
+            Some(20_000)
+        );
+        for headroom in [
+            serde_json::json!({"utilization": 20}),
+            serde_json::json!(null),
+        ] {
+            state
+                .pool
+                .lock()
+                .unwrap()
+                .report_model_family_quota(&id, "claude-fable-", 20_000);
+            body["seven_day_fable"] = headroom;
+            reconcile_claude_usage(&state, &id, &claude::parse_usage(&body, 1_000), 1_000);
+            let core = state.pool.lock().unwrap();
+            assert_eq!(core.model_cooling_until(&id, "claude-fable-5-2"), None);
+            assert_eq!(
+                core.model_cooling_until(&id, "claude-fable-5-1"),
+                Some(40_000)
+            );
         }
     }
 }

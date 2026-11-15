@@ -679,7 +679,10 @@ fn test_saturation_reports_minimum_reset(tc: TestCase) {
         built
             .core
             .report(&id, Outcome::QuotaExhausted { until_ms: reset });
-        latest_by_account.insert(id, reset);
+        latest_by_account
+            .entry(id)
+            .and_modify(|until| *until = (*until).max(reset))
+            .or_insert(reset);
     }
     if latest_by_account.is_empty() {
         return;
@@ -1152,6 +1155,56 @@ fn test_opencode_go_namespace_strips_exactly_once(tc: TestCase) {
     if !id.to_ascii_lowercase().starts_with("opencode-go/") {
         assert_eq!(upstream_model(&id), id, "an unnamespaced id passes through");
     }
+}
+
+#[hegel::test]
+fn test_late_quota_cannot_readmit_a_protected_account(tc: TestCase) {
+    let deadline: i64 = tc.draw(gs::integers::<i64>().min_value(1).max_value(1_000_000));
+    let disabled: bool = tc.draw(gs::booleans());
+    let protected = if disabled {
+        AccountStatus::Disabled
+    } else {
+        AccountStatus::AuthError
+    };
+    let mut built = build(1, 1);
+    let id = &built.accounts[0];
+    built.core.set_status(id, protected, 0);
+    built
+        .core
+        .report(id, Outcome::QuotaExhausted { until_ms: deadline });
+    built.core.sweep(deadline);
+    assert_eq!(built.core.account(id).unwrap().status, protected);
+    assert!(matches!(
+        built
+            .core
+            .select(deadline, None, "gpt-5.5", Surface::OpenAI),
+        Err(SelectError::NoAccounts)
+    ));
+}
+
+#[hegel::test]
+fn test_family_quota_never_blocks_an_unrelated_model(tc: TestCase) {
+    let now: i64 = tc.draw(gs::integers::<i64>().min_value(0).max_value(1_000_000));
+    let window: i64 = tc.draw(gs::integers::<i64>().min_value(1).max_value(100_000));
+    let store = Store::in_memory().unwrap();
+    let mut core = PoolCore::new(&store, openai_surfaces());
+    core.insert_account(account("claude-a", BackendId::Claude));
+    core.report_model_family_quota("claude-a", "claude-fable-", now + window);
+    assert!(matches!(
+        core.select(now, None, "claude-fable-5", Surface::Anthropic),
+        Err(SelectError::Saturated { until_ms }) if until_ms == now + window
+    ));
+    assert_eq!(
+        core.select(now, None, "claude-haiku-5-5", Surface::Anthropic)
+            .unwrap()
+            .account_id,
+        "claude-a"
+    );
+    core.sweep(now + window);
+    assert!(
+        core.select(now + window, None, "claude-fable-5", Surface::Anthropic)
+            .is_ok()
+    );
 }
 
 #[hegel::test]

@@ -364,8 +364,10 @@ pub async fn delete_account(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
+    let mut pool = state.pool.lock().unwrap();
     state.store.delete_account(&id);
-    state.pool.lock().unwrap().remove_account(&id);
+    pool.remove_account(&id);
+    state.observations.lock().unwrap().remove(&id);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -373,7 +375,11 @@ pub async fn disable_account(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    set_status(&state, &id, AccountStatus::Disabled, 0)
+    let mut pool = state.pool.lock().unwrap();
+    if state.store.get_account(&id).is_none() {
+        return (StatusCode::NOT_FOUND, "unknown account").into_response();
+    }
+    set_status(&state, &mut pool, &id, AccountStatus::Disabled, 0)
 }
 
 /// @cc [owner:ghuntley,label:pool] enable-clears-recoverable-status
@@ -387,6 +393,7 @@ pub async fn enable_account(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
+    let mut pool = state.pool.lock().unwrap();
     let Some(account) = state.store.get_account(&id) else {
         return (StatusCode::NOT_FOUND, "unknown account").into_response();
     };
@@ -395,7 +402,7 @@ pub async fn enable_account(
         AccountStatus::Disabled | AccountStatus::AuthError => (AccountStatus::Healthy, 0),
         AccountStatus::Healthy => (AccountStatus::Healthy, 0),
     };
-    set_status(&state, &id, next, reset_at)
+    set_status(&state, &mut pool, &id, next, reset_at)
 }
 
 /// @cc [owner:ghuntley,label:auth] manual-refresh-endpoint
@@ -434,11 +441,18 @@ pub async fn refresh_account(
             .into_response();
     }
     crate::logging::log_token_rotation(&id, &account.label, "rotated", "manual");
-    let refreshed = state.store.get_account(&id).unwrap_or(account);
+    let mut pool = state.pool.lock().unwrap();
+    let Some(refreshed) = state.store.get_account(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "unknown_account", "message": "unknown account" })),
+        )
+            .into_response();
+    };
     let status = match crate::tokens::status_after_manual_refresh(&refreshed) {
         Some(next) => {
             state.store.update_account_status(&id, next, 0);
-            state.pool.lock().unwrap().set_status(&id, next, 0);
+            pool.set_status(&id, next, 0);
             next
         }
         None => refreshed.status,
@@ -526,9 +540,10 @@ pub struct ResetQuery {
 /// `reset_account` MUST return 404 for an unknown account id and otherwise delegate to
 /// `ResetManager::manual_reset` with the `force` query flag for a ChatGPT/Codex account, or to
 /// the Claude Code redemption path for a Claude account. Every non-2xx response MUST carry a
-/// JSON body with a stable `error` code and a human `message`; refusals that `force` can override
-/// (`not_rate_limited`, `already_redeemed`) and `no_credit` MUST be 409, `not_codex` 400, and
-/// upstream failures 502.
+/// JSON body with a stable `error` code and a human `message`. `not_rate_limited`,
+/// `already_redeemed` and `no_credit` MUST be 409, `not_codex` 400, and upstream failures 502.
+/// Force MAY bypass local eligibility refusals, never an upstream consume refusal:
+/// Claude's `nothing_to_reset` MUST remain 409 `not_rate_limited` even when forced.
 pub async fn reset_account(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -573,11 +588,18 @@ pub async fn reset_account(
                 "available_resets": outcome.available_resets,
             }))
             .into_response(),
-            Err(error) => (
-                StatusCode::CONFLICT,
-                Json(json!({ "error": error.code(), "message": error.message() })),
-            )
-                .into_response(),
+            Err(error) => {
+                let status = match error {
+                    crate::claude::ClaudeResetError::Upstream(_) => StatusCode::BAD_GATEWAY,
+                    crate::claude::ClaudeResetError::NoCredit
+                    | crate::claude::ClaudeResetError::NotRateLimited => StatusCode::CONFLICT,
+                };
+                (
+                    status,
+                    Json(json!({ "error": error.code(), "message": error.message() })),
+                )
+                    .into_response()
+            }
         };
     }
     match state
@@ -617,14 +639,18 @@ pub async fn reset_account(
     }
 }
 
-fn set_status(state: &Arc<AppState>, id: &str, status: AccountStatus, reset_at: i64) -> Response {
-    if state.store.get_account(id).is_none() {
-        return (StatusCode::NOT_FOUND, "unknown account").into_response();
-    }
+/// Caller holds the pool lock so an operator decision is atomic with passive observations.
+fn set_status(
+    state: &AppState,
+    pool: &mut crate::pool::PoolCore,
+    id: &str,
+    status: AccountStatus,
+    reset_at: i64,
+) -> Response {
     state.store.update_account_status(id, status, reset_at);
     // An operator decision supersedes any automatic disable, so the plan gate leaves it alone.
     state.store.set_disabled_reason(id, None);
-    state.pool.lock().unwrap().set_status(id, status, reset_at);
+    pool.set_status(id, status, reset_at);
     StatusCode::NO_CONTENT.into_response()
 }
 

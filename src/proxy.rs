@@ -323,6 +323,9 @@ fn attach_request_id(mut resp: Response, request_id: &str) -> Response {
 enum Attempt {
     Respond(Response),
     Failover(Option<Response>),
+    /// Refresh succeeded; retry this selection once with credentials reloaded from the store.
+    Refreshed,
+    ModelUnavailable(Response),
     /// The stream failed with a capacity code before any output; `replay` holds what upstream
     /// sent, for the client if no other account succeeds.
     Overloaded {
@@ -333,10 +336,11 @@ enum Attempt {
 
 /// @cc [owner:ghuntley,label:proxy] saturation-fail-fast-429
 /// When selection returns `Saturated`, `infer` MUST first make one automatic Codex reset attempt
-/// for a live Codex-pool outage, then select again. If no account recovers, it MUST respond with
-/// 429 and `Retry-After` equal to the seconds until `until_ms`. Exception: once an account has
-/// been excluded for an overload before output, a failed selection MUST return that held upstream
-/// response instead, without a reset attempt.
+/// only if Codex is eligible for the requested model and surface, then select again. Every
+/// automatic reset call MUST obey this eligibility gate. If no account recovers, it MUST respond with
+/// 429 and `Retry-After` equal to the seconds until `until_ms`. Exception: when selection fails
+/// after a nonquota failure, a model-scoped refusal, or an overload before output, the held
+/// upstream response MUST be returned instead, without spending a reset credit.
 pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response {
     run(state, req, Surface::OpenAI).await
 }
@@ -448,19 +452,31 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
         Surface::OpenAI => extract_sticky_key(&body, session_header.as_deref()),
     };
 
-    state
-        .resets
-        .maybe_reset(&state.pool, &state.store, &state.tokens, &request_id)
-        .await;
+    let codex_eligible = || {
+        state
+            .pool
+            .lock()
+            .unwrap()
+            .backend_eligible(BackendId::Codex, &model, surface)
+    };
+    if codex_eligible() {
+        state
+            .resets
+            .maybe_reset(&state.pool, &state.store, &state.tokens, &request_id)
+            .await;
+    }
 
     let total_accounts = state.pool.lock().unwrap().accounts.len().max(1);
     let mut last_upstream: Option<Response> = None;
+    let mut model_rejection: Option<Response> = None;
+    let mut replay_on_exhaustion = false;
     let mut refreshed: std::collections::HashSet<String> = Default::default();
     let mut reset_after_quota = false;
     let mut attempts = 0;
     let mut max_attempts = total_accounts;
-    // Accounts whose stream failed with a capacity code before output, skipped for this request.
-    let mut overloaded: std::collections::HashSet<String> = Default::default();
+    // Every failed account is skipped, including sticky selections and transient failures.
+    let mut excluded: std::collections::HashSet<String> = Default::default();
+    let mut quota_failed: std::collections::HashSet<String> = Default::default();
 
     while attempts < max_attempts {
         attempts += 1;
@@ -469,13 +485,23 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
             sticky.as_deref(),
             &model,
             surface,
-            &overloaded,
+            &excluded,
         );
 
         if selection.is_err()
-            && !overloaded.is_empty()
-            && let Some(replay) = last_upstream.take()
+            && !excluded.is_empty()
+            && (model_rejection.is_some() || replay_on_exhaustion)
         {
+            let replay = model_rejection
+                .take()
+                .or_else(|| last_upstream.take())
+                .unwrap_or_else(|| {
+                    error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "pool exhausted: every subscription attempt failed",
+                        "pool_exhausted",
+                    )
+                });
             logging::log_request_completed(
                 &request_id,
                 replay.status().as_u16(),
@@ -484,7 +510,10 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
             return attach_request_id(replay, &request_id);
         }
 
-        if matches!(selection, Err(SelectError::Saturated { .. })) && !reset_after_quota {
+        if matches!(selection, Err(SelectError::Saturated { .. }))
+            && !reset_after_quota
+            && codex_eligible()
+        {
             reset_after_quota = true;
             // Always select again: the reset attempt can wait on the shared reset lock and on
             // usage fetches, during which cooling deadlines may pass even if nothing was redeemed.
@@ -492,12 +521,21 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
                 .resets
                 .maybe_reset(&state.pool, &state.store, &state.tokens, &request_id)
                 .await;
+            {
+                let pool = state.pool.lock().unwrap();
+                excluded.retain(|id| {
+                    !quota_failed.contains(id)
+                        || !pool
+                            .account(id)
+                            .is_some_and(|account| account.status == AccountStatus::Healthy)
+                });
+            }
             selection = state.pool.lock().unwrap().select_excluding(
                 now_ms(),
                 sticky.as_deref(),
                 &model,
                 surface,
-                &overloaded,
+                &excluded,
             );
         }
 
@@ -552,20 +590,26 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
             }
         }
 
-        match attempt_account(
-            &state,
-            &request_id,
-            &endpoint,
-            &target,
-            &model,
-            sticky.as_deref(),
-            &selection,
-            body_bytes.clone(),
-            &client_headers,
-            &mut refreshed,
-        )
-        .await
-        {
+        let attempt = loop {
+            let attempt = attempt_account(
+                &state,
+                &request_id,
+                &endpoint,
+                &target,
+                &model,
+                sticky.as_deref(),
+                &selection,
+                body_bytes.clone(),
+                &client_headers,
+                &mut refreshed,
+            )
+            .await;
+            if matches!(attempt, Attempt::Refreshed) {
+                continue;
+            }
+            break attempt;
+        };
+        match attempt {
             Attempt::Respond(resp) => {
                 logging::log_request_completed(
                     &request_id,
@@ -575,23 +619,68 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
                 return resp;
             }
             Attempt::Overloaded { account_id, replay } => {
-                overloaded.insert(account_id);
+                excluded.insert(account_id);
                 last_upstream = Some(replay);
+                replay_on_exhaustion = true;
+            }
+            Attempt::ModelUnavailable(response) => {
+                excluded.insert(selection.account_id.clone());
+                model_rejection = Some(response);
             }
             Attempt::Failover(passthrough) => {
+                excluded.insert(selection.account_id.clone());
+                let cooling = state
+                    .pool
+                    .lock()
+                    .unwrap()
+                    .account(&selection.account_id)
+                    .is_some_and(|account| account.status == AccountStatus::Cooling);
+                if cooling {
+                    quota_failed.insert(selection.account_id.clone());
+                }
+                replay_on_exhaustion |= !cooling;
                 last_upstream = passthrough.or(last_upstream);
-                if attempts == max_attempts && !reset_after_quota {
+                if attempts == max_attempts
+                    && !replay_on_exhaustion
+                    && model_rejection.is_none()
+                    && !reset_after_quota
+                    && codex_eligible()
+                {
                     reset_after_quota = true;
                     if state
                         .resets
                         .maybe_reset(&state.pool, &state.store, &state.tokens, &request_id)
                         .await
                     {
+                        let pool = state.pool.lock().unwrap();
+                        excluded.retain(|id| {
+                            !quota_failed.contains(id)
+                                || !pool
+                                    .account(id)
+                                    .is_some_and(|account| account.status == AccountStatus::Healthy)
+                        });
                         max_attempts += 1;
                     }
                 }
             }
+            Attempt::Refreshed => unreachable!("auth retry is handled before failover"),
         }
+    }
+
+    if let Some(response) = model_rejection {
+        return attach_request_id(response, &request_id);
+    }
+    if replay_on_exhaustion {
+        return attach_request_id(
+            last_upstream.take().unwrap_or_else(|| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "pool exhausted: every subscription attempt failed",
+                    "pool_exhausted",
+                )
+            }),
+            &request_id,
+        );
     }
 
     let saturated = state
@@ -617,15 +706,20 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
 }
 
 /// @cc [owner:ghuntley,label:proxy] failover-bounded-by-accounts
-/// A request MUST make at most as many attempts as configured accounts, plus one additional attempt
-/// after a successful banked reset, and the first successful upstream response MUST be returned
+/// A request MUST try each failed account at most once, including sticky bindings, except for one
+/// same-account retry after a successful auth refresh and one retry after a successful banked reset.
+/// Auth retries MUST NOT consume the distinct-account budget and MUST use current store credentials.
+/// Every attempt MUST check current account health and model cooldown under the pool lock before
+/// acquiring it; a completed Disable or deletion MUST prevent a post-refresh retry.
+/// The first successful upstream response MUST be returned
 /// to the client; a 2xx stream that fails with a capacity code before any output is not successful:
 /// the account MUST be excluded for the rest of the request (without changing its health) and
 /// the next account tried. Upstream error bodies MUST be preserved and
 /// returned when every attempt fails (or a 503 `pool_exhausted` error when no upstream response
 /// was ever received). An upstream 401 or 403 MUST trigger exactly one forced token refresh and one
-/// same-account retry per request; a second 401 or 403 (or a failed refresh) MUST classify the
-/// account `AuthFailed` and fail over.
+/// same-account retry per account per request; a second 401 or 403 (or a failed refresh) MUST classify
+/// the account `AuthFailed` and fail over. A model-scoped refusal MUST NOT cool other models, and
+/// its upstream response MUST be preserved when no serving account succeeds.
 async fn attempt_account(
     state: &Arc<AppState>,
     request_id: &str,
@@ -643,12 +737,7 @@ async fn attempt_account(
     let Some(backend) = state.backends.get(&selection.backend).cloned() else {
         return Attempt::Failover(None);
     };
-    let account = state
-        .pool
-        .lock()
-        .unwrap()
-        .account(&selection.account_id)
-        .cloned();
+    let account = state.store.get_account(&selection.account_id);
     let Some(account) = account else {
         return Attempt::Failover(None);
     };
@@ -656,6 +745,15 @@ async fn attempt_account(
 
     {
         let mut pool = state.pool.lock().unwrap();
+        if pool
+            .account(&selection.account_id)
+            .is_none_or(|account| !account.healthy())
+            || pool
+                .model_cooling_until(&selection.account_id, model)
+                .is_some_and(|until| until > started_ms)
+        {
+            return Attempt::Failover(None);
+        }
         pool.acquire(&selection.account_id);
     }
     let guard = InflightGuard {
@@ -851,9 +949,8 @@ async fn attempt_account(
         persist_usage(&state.store, &record);
         match state.tokens.force_refresh(&selection.account_id).await {
             Ok(_) => {
-                report_outcome(state, &selection.account_id, Outcome::Transient);
                 drop(guard);
-                return Attempt::Failover(None);
+                return Attempt::Refreshed;
             }
             Err(e) => {
                 tracing::warn!(request_id = %request_id, error = %e, "token.refresh_failed");
@@ -865,7 +962,14 @@ async fn attempt_account(
                     "refresh rejected",
                 );
                 drop(guard);
-                return Attempt::Failover(None);
+                return Attempt::Failover(Some(upstream_error_response(
+                    status,
+                    response_headers
+                        .get(http::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("application/json"),
+                    body_text,
+                )));
             }
         }
     }
@@ -920,19 +1024,7 @@ async fn attempt_account(
                 &format!("{model} until {until_ms}"),
             );
         }
-        if let Some(new_status) = {
-            let mut pool = state.pool.lock().unwrap();
-            pool.report(&selection.account_id, outcome.clone())
-        } {
-            let reset_at = {
-                let pool = state.pool.lock().unwrap();
-                pool.account(&selection.account_id)
-                    .map(|a| a.reset_at)
-                    .unwrap_or(0)
-            };
-            state
-                .store
-                .update_account_status(&selection.account_id, new_status, reset_at);
+        if report_outcome(state, &selection.account_id, outcome.clone()) {
             match &outcome {
                 Outcome::QuotaExhausted { until_ms } => {
                     logging::log_account_state(
@@ -957,7 +1049,6 @@ async fn attempt_account(
                 _ => {}
             }
         }
-        report_outcome(state, &selection.account_id, Outcome::Ok);
         drop(guard);
         push_log(
             state,
@@ -970,7 +1061,7 @@ async fn attempt_account(
             status.as_u16(),
             started.elapsed().as_millis() as u64,
         );
-        Attempt::Failover(Some(upstream_error_response(
+        let response = upstream_error_response(
             status,
             &resp_headers
                 .get(http::header::CONTENT_TYPE)
@@ -978,7 +1069,12 @@ async fn attempt_account(
                 .unwrap_or("application/json")
                 .to_string(),
             body_text,
-        )))
+        );
+        if matches!(outcome, Outcome::ModelQuotaExhausted { .. }) {
+            Attempt::ModelUnavailable(response)
+        } else {
+            Attempt::Failover(Some(response))
+        }
     } else {
         let content_type = response
             .headers()
@@ -1180,26 +1276,13 @@ fn observe_response(
     if until <= now {
         return;
     }
-    let current = {
-        state
-            .pool
-            .lock()
-            .unwrap()
-            .account(account_id)
-            .map(|a| a.reset_at)
-            .unwrap_or(0)
-    };
-    if until <= current {
+    if !report_outcome(
+        state,
+        account_id,
+        Outcome::QuotaExhausted { until_ms: until },
+    ) {
         return;
     }
-    state
-        .pool
-        .lock()
-        .unwrap()
-        .set_status(account_id, AccountStatus::Cooling, until);
-    state
-        .store
-        .update_account_status(account_id, AccountStatus::Cooling, until);
     logging::log_account_state(
         account_id,
         Some(&account.label),
@@ -1208,20 +1291,23 @@ fn observe_response(
     );
 }
 
-fn report_outcome(state: &Arc<AppState>, account_id: &str, outcome: Outcome) {
-    let status_change = {
-        let mut pool = state.pool.lock().unwrap();
-        pool.report(account_id, outcome)
+/// @cc [owner:ghuntley,label:pool] passive-health-persistence
+/// Passive outcomes MUST preserve missing, Disabled and AuthError accounts and MUST NOT shorten
+/// Cooling deadlines. A changed status MUST be persisted while holding the pool lock, in pool ->
+/// store order, without awaiting, so a concurrent operator change cannot be overwritten.
+fn report_outcome(state: &Arc<AppState>, account_id: &str, outcome: Outcome) -> bool {
+    let mut pool = state.pool.lock().unwrap();
+    let Some(status) = pool.report(account_id, outcome) else {
+        return false;
     };
-    if let Some(new_status) = status_change {
-        let reset_at = {
-            let pool = state.pool.lock().unwrap();
-            pool.account(account_id).map(|a| a.reset_at).unwrap_or(0)
-        };
-        state
-            .store
-            .update_account_status(account_id, new_status, reset_at);
-    }
+    let reset_at = pool
+        .account(account_id)
+        .expect("reported account exists")
+        .reset_at;
+    state
+        .store
+        .update_account_status(account_id, status, reset_at);
+    true
 }
 
 #[allow(clippy::too_many_arguments)]

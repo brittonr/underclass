@@ -90,8 +90,11 @@ credential.
   account's own usage API (`GET /api/oauth/usage`) reports all three, plus the plan and the
   banked rate-limit reset credits, so underclass reads an account's quota **without sending
   anything that looks like a Claude Code request** - which keeps the credential usable only for
-  the official client. The pool cools an account when a window is spent, and a window that is
-  exhausted for one model family only blocks that model on that account.
+  the official client. Shared five-hour/seven-day exhaustion can cool an account until the
+  latest exhausted shared reset. A spent family window blocks only that family's model variants,
+  independently of exact-model HTTP refusals. Fresh valid shared headroom can readmit only a
+  currently cooling account; malformed reported windows cannot establish headroom, and passive
+  observations must preserve operator disables, authentication blocks and deleted accounts.
 
 - **A 429's scope decides the cooldown.** Anthropic reports the scope in the response headers:
   a rejected shared five-hour or seven-day window blocks the credential across models, while a
