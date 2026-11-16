@@ -11,12 +11,10 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::time::Instant;
 use tower_http::request_id::RequestId;
 
@@ -290,92 +288,6 @@ fn error_response(status: StatusCode, message: &str, error_type: &str) -> Respon
         .into_response()
 }
 
-fn client_error_body(
-    backend: &dyn crate::provider::Backend,
-    endpoint: &str,
-    status: u16,
-    content_type: &str,
-    body: String,
-) -> (String, String) {
-    match backend.translate_error(endpoint, status, &body) {
-        Some(translated) => ("application/json".to_string(), translated),
-        None => (content_type.to_string(), body),
-    }
-}
-
-struct Adapted<S> {
-    inner: S,
-    adapter: Box<dyn crate::provider::ResponseAdapter>,
-    pending: VecDeque<axum::body::Bytes>,
-    finished: bool,
-}
-
-impl<S> Adapted<S> {
-    fn new(inner: S, adapter: Box<dyn crate::provider::ResponseAdapter>) -> Self {
-        Self {
-            inner,
-            adapter,
-            pending: VecDeque::new(),
-            finished: false,
-        }
-    }
-}
-
-impl<S> Stream for Adapted<S>
-where
-    S: Stream<Item = reqwest::Result<axum::body::Bytes>> + Unpin,
-{
-    type Item = reqwest::Result<axum::body::Bytes>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        loop {
-            if let Some(chunk) = this.pending.pop_front() {
-                return Poll::Ready(Some(Ok(chunk)));
-            }
-            if this.finished {
-                return Poll::Ready(None);
-            }
-            match Pin::new(&mut this.inner).poll_next(cx) {
-                Poll::Ready(Some(Ok(chunk))) => {
-                    let translated = this.adapter.push(&chunk);
-                    if !translated.is_empty() {
-                        this.pending.push_back(axum::body::Bytes::from(translated));
-                    }
-                }
-                Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
-                Poll::Ready(None) => {
-                    this.finished = true;
-                    let tail = this.adapter.finish();
-                    if !tail.is_empty() {
-                        this.pending.push_back(axum::body::Bytes::from(tail));
-                    }
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-}
-
-enum MaybeAdapted<S> {
-    Raw(S),
-    Adapted(Adapted<S>),
-}
-
-impl<S> Stream for MaybeAdapted<S>
-where
-    S: Stream<Item = reqwest::Result<axum::body::Bytes>> + Unpin,
-{
-    type Item = reqwest::Result<axum::body::Bytes>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.get_mut() {
-            MaybeAdapted::Raw(inner) => Pin::new(inner).poll_next(cx),
-            MaybeAdapted::Adapted(inner) => Pin::new(inner).poll_next(cx),
-        }
-    }
-}
-
 fn upstream_error_response(status: StatusCode, content_type: &str, body: String) -> Response {
     (
         status,
@@ -420,8 +332,6 @@ enum Attempt {
         account_id: String,
         replay: Response,
     },
-    /// The selected backend does not admit this client. No credential is used.
-    ClientRejected,
 }
 
 /// @cc [owner:ghuntley,label:proxy] saturation-fail-fast-429
@@ -717,16 +627,6 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
                 excluded.insert(selection.account_id.clone());
                 model_rejection = Some(response);
             }
-            Attempt::ClientRejected => {
-                return attach_request_id(
-                    error_response(
-                        StatusCode::FORBIDDEN,
-                        "this endpoint only accepts official Claude Code clients",
-                        "client_not_allowed",
-                    ),
-                    &request_id,
-                );
-            }
             Attempt::Failover(passthrough) => {
                 excluded.insert(selection.account_id.clone());
                 let cooling = state
@@ -837,10 +737,6 @@ async fn attempt_account(
     let Some(backend) = state.backends.get(&selection.backend).cloned() else {
         return Attempt::Failover(None);
     };
-    let client_body = serde_json::from_slice::<Value>(&body_bytes).unwrap_or(Value::Null);
-    if !backend.accepts_client(client_headers, &client_body) {
-        return Attempt::ClientRejected;
-    }
     let account = state.store.get_account(&selection.account_id);
     let Some(account) = account else {
         return Attempt::Failover(None);
@@ -881,6 +777,7 @@ async fn attempt_account(
         }
     };
 
+    let url = backend.rewrite_url(target, &account);
     let mut headers = HeaderMap::new();
     if backend.forward_client_headers() {
         for (name, value) in client_headers.iter() {
@@ -916,12 +813,11 @@ async fn attempt_account(
         .unwrap()
         .contains(&selection.backend)
         && backend.auto_stream_usage(endpoint, &mut outbound_body);
-    let url = backend.upstream_url(target, &account, &outbound_body);
-    backend.finalize_body(&account, target, &mut outbound_body, sticky);
     let outbound_bytes = if backend.forward_body_verbatim() {
         // The upstream validates the client's own body, so it travels byte for byte.
         body_bytes.to_vec()
     } else {
+        backend.prepare_body(&mut outbound_body);
         serde_json::to_vec(&outbound_body).unwrap_or_else(|_| body_bytes.to_vec())
     };
 
@@ -1066,19 +962,12 @@ async fn attempt_account(
                     "refresh rejected",
                 );
                 drop(guard);
-                let (content_type, body_text) = client_error_body(
-                    &*backend,
-                    endpoint,
-                    status.as_u16(),
+                return Attempt::Failover(Some(upstream_error_response(
+                    status,
                     response_headers
                         .get(http::header::CONTENT_TYPE)
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or("application/json"),
-                    body_text,
-                );
-                return Attempt::Failover(Some(upstream_error_response(
-                    status,
-                    &content_type,
                     body_text,
                 )));
             }
@@ -1172,17 +1061,15 @@ async fn attempt_account(
             status.as_u16(),
             started.elapsed().as_millis() as u64,
         );
-        let (content_type, body_text) = client_error_body(
-            &*backend,
-            endpoint,
-            status.as_u16(),
-            resp_headers
+        let response = upstream_error_response(
+            status,
+            &resp_headers
                 .get(http::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("application/json"),
+                .unwrap_or("application/json")
+                .to_string(),
             body_text,
         );
-        let response = upstream_error_response(status, &content_type, body_text);
         if matches!(outcome, Outcome::ModelQuotaExhausted { .. }) {
             Attempt::ModelUnavailable(response)
         } else {
@@ -1195,12 +1082,8 @@ async fn attempt_account(
             .cloned()
             .unwrap_or(http::HeaderValue::from_static("application/json"));
         let status_code = status;
-        let is_stream = usage_is_stream(&fallback_body, content_type.as_bytes())
-            || usage_is_stream(&outbound_body, content_type.as_bytes());
-        let mut stream = match backend.response_adapter(endpoint, &fallback_body) {
-            Some(adapter) => MaybeAdapted::Adapted(Adapted::new(response.bytes_stream(), adapter)),
-            None => MaybeAdapted::Raw(response.bytes_stream()),
-        };
+        let is_stream = usage_is_stream(&outbound_body, content_type.as_bytes());
+        let mut stream = response.bytes_stream();
         let mut finish = UsageFinish {
             store: state.store.clone(),
             logs: state.logs.clone(),

@@ -55,7 +55,7 @@
             '';
 
             meta = with pkgs.lib; {
-              description = "Pooled multi-subscription ChatGPT/Codex, Copilot, Claude, OpenCode Go, and Gemini proxy";
+              description = "Pooled multi-subscription ChatGPT/Codex and GitHub Copilot proxy with an OpenAI-compatible endpoint";
               homepage = "https://github.com/ghuntley/underclass";
               license = licenses.mit;
               mainProgram = "underclass";

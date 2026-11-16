@@ -56,7 +56,6 @@
         <button onclick="startFlow()">Add account</button>
         <button onclick="refreshCopilotCatalog()">Refresh Copilot catalog</button>
         <button onclick="refreshOpencodeGoCatalog()">Refresh OpenCode Go catalog</button>
-        <button onclick="refreshGeminiCatalog()">Refresh Gemini catalog</button>
       </div>
     </div>
     <table id="accounts">
@@ -140,7 +139,6 @@
       <option value="copilot">copilot</option>
       <option value="claude">claude</option>
       <option value="opencode-go">opencode-go</option>
-      <option value="gemini">gemini</option>
     </select>
     <label>models (JSON array of {id, name, context, input, output})</label>
     <textarea id="catalogEditor" rows="10"></textarea>
@@ -160,17 +158,10 @@
       <option value="copilot">GitHub Copilot</option>
       <option value="claude">Claude Code (Anthropic)</option>
       <option value="opencode-go">OpenCode Go (API key)</option>
-      <option value="gemini">Gemini (Google AI Ultra)</option>
     </select>
     <div id="enterpriseWrap" style="display:none">
       <label>GitHub Enterprise URL or domain (blank for github.com)</label>
       <input id="flowEnterprise" placeholder="company.ghe.com">
-    </div>
-    <div id="geminiWrap" style="display:none">
-      <label>Google Cloud project id (only if Code Assist asks for one)</label>
-      <input id="flowProject" placeholder="my-gcp-project">
-      <label>label (blank for the Google account email)</label>
-      <input id="flowGeminiLabel" placeholder="ultra@gmail.com">
     </div>
     <div id="opencodeGoWrap" style="display:none">
       <label>OpenCode Console API key</label>
@@ -196,7 +187,7 @@
       <button class="primary" onclick="submitFlowCode()">Finish</button>
       <button onclick="closeFlow()">Cancel</button>
     </div>
-    <p class="muted" id="flowCodeHint">The callback page shows a code like <code>abc123#state</code>. Paste the whole thing.</p>
+    <p class="muted">The callback page shows a code like <code>abc123#state</code>. Paste the whole thing.</p>
   </div>
   <div id="flowDone" style="display:none">
     <p>✅ Account authorized.</p>
@@ -259,13 +250,6 @@ function formatQuota(o) {
   window('7d fable', o.seven_day_fable);
   window('mo', o.monthly);
   if (o.reset_credits) parts.push(o.reset_credits + ' reset' + (o.reset_credits > 1 ? 's' : ''));
-  if (Array.isArray(o.buckets) && o.buckets.length) {
-    return o.buckets.slice(0, 3).map(b => {
-      const pct = typeof b.remaining_fraction === 'number' ? Math.round(b.remaining_fraction * 100) + '%' : '?';
-      const model = b.model || 'quota';
-      return model + ' ' + pct;
-    }).join(' · ');
-  }
   if (!parts.length) return o.status || '—';
   return parts.join(' · ');
 }
@@ -507,7 +491,6 @@ document.getElementById('flowBackend').addEventListener('change', () => {
   const backend = document.getElementById('flowBackend').value;
   document.getElementById('enterpriseWrap').style.display = backend === 'copilot' ? 'block' : 'none';
   document.getElementById('opencodeGoWrap').style.display = backend === 'opencode-go' ? 'block' : 'none';
-  document.getElementById('geminiWrap').style.display = backend === 'gemini' ? 'block' : 'none';
 });
 
 async function startFlow() {
@@ -531,12 +514,6 @@ async function beginFlow() {
     body.api_key = keyInput.value.trim();
     keyInput.value = '';
     const label = document.getElementById('flowLabel').value.trim();
-    if (label) body.label = label;
-  }
-  if (backend === 'gemini') {
-    const project = document.getElementById('flowProject').value.trim();
-    const label = document.getElementById('flowGeminiLabel').value.trim();
-    if (project) body.project = project;
     if (label) body.label = label;
   }
   const res = await api('/admin/api/flows', { method: 'POST', body: JSON.stringify(body) });
@@ -581,10 +558,6 @@ function pollFlow(flowId) {
       document.getElementById('flowAwaitingCode').style.display = 'block';
       const link = document.getElementById('flowAuthorizeUrl');
       link.href = state.authorize_url; link.textContent = state.authorize_url;
-      const hint = document.getElementById('flowCodeHint');
-      hint.textContent = data.flow.backend === 'gemini'
-        ? 'Sign in with the Google AI Ultra account. The page shows an authorization code; paste that code.'
-        : 'The callback page shows a code like abc123#state. Paste the whole thing.';
     } else if (state.state === 'authorized') {
       clearInterval(flowTimer);
       document.getElementById('flowPending').style.display = 'none';
@@ -652,12 +625,6 @@ async function del(id) {
 }
 async function refreshCopilotCatalog() {
   await api('/admin/api/catalog/refresh-copilot', { method: 'POST' });
-  loadState();
-}
-async function refreshGeminiCatalog() {
-  const res = await api('/admin/api/catalog/refresh-gemini', { method: 'POST' });
-  const data = await res.json().catch(() => ({}));
-  if (data.errors && data.errors.length) alert(data.errors.join('\n'));
   loadState();
 }
 async function refreshOpencodeGoCatalog() {

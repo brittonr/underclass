@@ -1,6 +1,6 @@
 # underclass
 
-**A local proxy that pools multiple ChatGPT/Codex, GitHub Copilot, Claude Code, OpenCode Go, and Google AI Ultra subscriptions behind one endpoint.**
+**A local proxy that pools multiple ChatGPT/Codex, GitHub Copilot, Claude Code, and OpenCode Go subscriptions behind one endpoint.**
 
 ```
                        ┌────────────────────────────────────┐
@@ -18,9 +18,6 @@
                        │                                    │────► opencode.ai/inference/go
                        │                                    │      (L OpenCode Go subs,
                        │                                    │       Console API keys)
-                       │                                    │────► cloudcode-pa.googleapis.com
-                       │                                    │      (P Gemini / AI Ultra subs,
-                       │                                    │       Google OAuth paste-back)
                        └────────────────────────────────────┘
 ```
 
@@ -54,7 +51,7 @@ never writes them to diagnostics. Open the web UI and paste the value supplied a
 `UNDERCLASS_UI_TOKEN`.
 
 1. Open the web UI and paste the configured admin token.
-2. Click **Add account** → pick *ChatGPT / Codex*, *GitHub Copilot*, *Claude Code (Anthropic)*, *OpenCode Go (API key)*, or *Gemini (Google AI Ultra)* → follow the flow. The account is labeled automatically with the account's email or username; an OpenCode Go account takes the label you enter, or the public id of its Console key (`oc_sk_<id>`). Before adding Gemini, set `UNDERCLASS_GEMINI_CLIENT_ID` and `UNDERCLASS_GEMINI_CLIENT_SECRET` on the server from the `OAUTH_CLIENT_ID` and `OAUTH_CLIENT_SECRET` constants in the Gemini CLI file `packages/core/src/code_assist/oauth2.ts` (do not commit them). Then `underclass login --backend gemini` (add `--project <gcp-project-id>` only if Code Assist asks for one), sign in with the Ultra Google account, and paste the code the page shows.
+2. Click **Add account** → pick *ChatGPT / Codex*, *GitHub Copilot*, *Claude Code (Anthropic)*, or *OpenCode Go (API key)* → follow the flow. The account is labeled automatically with the account's email or username; an OpenCode Go account takes the label you enter, or the public id of its Console key (`oc_sk_<id>`).
 3. Repeat for every subscription you want in the pool.
 4. Point opencode at the pool:
 
@@ -88,7 +85,6 @@ export CLAUDE_CODE_OAUTH_TOKEN=<the underclass proxy key>
 - **Two surfaces, one pool.** `/v1/responses` and `/v1/chat/completions` speak OpenAI; `/v1/messages` speaks the Anthropic Messages API. A request is only ever routed to a backend that serves its surface, so an Anthropic request never lands on a Codex account and the other way round. See [ADR 0024](docs/adr/0024-surface-partitioned-routing.md).
 - **Claude Code subscriptions.** The Anthropic surface serves the official Claude Code client only: the request must carry `x-app: cli`, a `claude-cli/` user agent, the `claude-code-20250219` beta, and a Claude Code identity block, and underclass forwards the client's headers and body verbatim, swapping only the credential. The account's usage API reports shared five-hour and seven-day windows plus a family-specific weekly window. Shared exhaustion can extend the account cooldown to the latest exhausted shared reset; a family limit blocks only that family's model variants. Clearing a recovered family window does not erase an independent exact-model HTTP cooldown. The admin page shows the plan, quota windows and banked reset credits. **Use reset** is always manual and accepts shared or family-only exhaustion. Only explicit upstream success can report a redeemed credit; readmission additionally requires fresh shared headroom and a currently cooling account. A failed follow-up usage read preserves the confirmed redemption and current status, without readmitting or clearing family limits. `no_credit` and `nothing_to_reset` are 409 refusals; malformed/unknown consume results and upstream request failures are 502. Force bypasses local eligibility checks, not upstream refusals, and the admin page offers at most one forced retry. See [ADR 0023](docs/adr/0023-claude-code-subscription-backend.md).
 - **OpenCode Go subscriptions.** An OpenCode Go account is a Console API key, validated against the gateway's usage API when it is added. Its models are cataloged under the `opencode-go/` namespace (`opencode-go/kimi-k3`), so they never compete with a Codex model that shares the upstream id; underclass strips the namespace, sends the request to `https://opencode.ai/inference/go/openai/v1/...`, and sends the sticky key as `x-opencode-session`, which the gateway requires (a keyless request gets a session derived from its conversation's opening). A spent allowance (429 `GoUsageLimitError`, or 402 when Extra Usage has no balance) cools only the refused model on that account until the gateway's `Retry-After`, because the free models keep working. The admin page and `utop` show the 5-hour, weekly, and monthly allowance windows. See [ADR 0027](docs/adr/0027-opencode-go-backend.md).
-- **Google AI Ultra / Gemini.** A Gemini account is the Google OAuth grant the Gemini CLI uses for Code Assist. underclass translates OpenAI chat, OpenAI responses, and Anthropic messages (including streams and tool calls) onto `cloudcode-pa.googleapis.com/v1internal:generateContent`. Models keep their own ids (`gemini-2.5-pro`, `gemini-3-pro-preview`, …). A 429 or `RESOURCE_EXHAUSTED` cools that account until Google's `retryDelay` or `Retry-After`, then the pool readmits it. Several Ultra accounts share the flat pool and sticky sessions. A free Code Assist tier is stored as plan `free` and taken out of rotation. See [ADR 0028](docs/adr/0028-gemini-backend.md) for the sign-in steps and what was not verified against a live account.
 - **Failover only before output.** A stream that fails with an upstream capacity error before any output is retried on another account. Once output starts — or, on the Anthropic surface, once the upstream has accepted the request — upstream errors pass through, so half-finished turns are never re-sent silently.
 
 Design decisions and their trade-offs live in [`docs/adr/`](docs/adr) — start with [ADR 0010](docs/adr/0010-unprefixed-routing-flat-pool.md) for the routing model.
@@ -106,10 +102,9 @@ Optional `~/.config/underclass/config.toml`:
 | `copilot_cooldown_secs` | `1800` | same, for Copilot |
 | `claude_cooldown_secs` | `1800` | same, for Claude Code accounts |
 | `opencode_go_cooldown_secs` | `1800` | how long a model refused by OpenCode Go (429 or 402) cools on that account when the gateway omits `retry-after` |
-| `gemini_cooldown_secs` | `1800` | how long a Gemini account cools after 429 / `RESOURCE_EXHAUSTED` when Google sends neither `retryDelay` nor `Retry-After` |
 | `stats_retention_days` | `730` | how long usage rows, upstream events, and daily stats rollups are kept |
 
-Environment overrides: `UNDERCLASS_BIND`, `UNDERCLASS_PROXY_KEY`, `UNDERCLASS_UI_TOKEN`, `UNDERCLASS_MONITOR_SOCKET` (local socket path), `UNDERCLASS_STATS_RETENTION_DAYS`, `UNDERCLASS_GEMINI_CLIENT_ID`, `UNDERCLASS_GEMINI_CLIENT_SECRET` (the Gemini CLI installed-app OAuth client, required only to add or refresh a Gemini account). For testing against a mock upstream: `UNDERCLASS_CODEX_UPSTREAM`, `UNDERCLASS_COPILOT_UPSTREAM`, `UNDERCLASS_CLAUDE_UPSTREAM`, `UNDERCLASS_OPENCODE_GO_UPSTREAM`, `UNDERCLASS_GEMINI_UPSTREAM` (default to the real endpoints).
+Environment overrides: `UNDERCLASS_BIND`, `UNDERCLASS_PROXY_KEY`, `UNDERCLASS_UI_TOKEN`, `UNDERCLASS_MONITOR_SOCKET` (local socket path), `UNDERCLASS_STATS_RETENTION_DAYS`. For testing against a mock upstream: `UNDERCLASS_CODEX_UPSTREAM`, `UNDERCLASS_COPILOT_UPSTREAM`, `UNDERCLASS_CLAUDE_UPSTREAM`, `UNDERCLASS_OPENCODE_GO_UPSTREAM` (default to the real endpoints).
 
 State (credentials, sticky bindings, model catalog, minted keys) lives in `~/.local/share/underclass/pool.db`. Delete it to start fresh.
 
@@ -122,8 +117,6 @@ underclass stats [--since 24h|7d|90d|2y] [--bucket minute|hour|day] [--by total|
 underclass stats import-codex [--dir DIR]... [--dry-run] [--url ORIGIN]
 underclass connect [--base-url URL] [--api-key KEY] [--model MODEL]
                    [--project] [--no-default-model] [--dry-run] [--remove]
-underclass login [--backend gemini] [--project GCP_PROJECT] [--label LABEL]
-                 [--code CODE] [--url ORIGIN]
 ```
 
 `stats` prints a UTC table with these columns: requests, sessions, tokens in/out, peak/mean concurrency, failed streams, and overloaded / policy / quota / cooling / saturated events. It uses the same admin token resolution as `top`. `stats import-codex` backfills capacity, quota, retry-exhaustion, and policy errors (such as `cyber_policy`) from `$CODEX_HOME/sessions` rollout logs. It sends only timestamps, kinds, codes, models, and dedupe keys, and is safe to re-run.
@@ -153,12 +146,11 @@ Run `underclass top` (or `utop` from the Nix package) in a second terminal while
 | `POST /admin/api/events/import` | admin token | idempotent upstream-event backfill (used by `stats import-codex`) |
 | `POST /admin/api/flows` | admin token | start a device-flow onboarding; for `{"backend": "opencode-go", "api_key": …, "label": …}`, validate and add an OpenCode Go key and return an authorized flow |
 | `GET /admin/api/flows/{id}` | admin token | poll an onboarding flow |
-| `POST /admin/api/flows/{id}/code` | admin token | finish a Claude Code or Gemini paste-back flow |
+| `POST /admin/api/flows/{id}/code` | admin token | finish a Claude Code paste-back flow |
 | `POST /admin/api/accounts/{id}/enable|disable|relogin` | admin token | account controls; an OpenCode Go relogin takes `{"api_key": …}` and swaps the account's key |
 | `DELETE /admin/api/accounts/{id}` | admin token | remove from pool |
 | `GET|PUT /admin/api/catalog/{backend}` | admin token | inspect/edit model catalog |
 | `POST /admin/api/catalog/refresh-opencode-go` | admin token | refresh the OpenCode Go catalog from the gateway's live model list |
-| `POST /admin/api/catalog/refresh-gemini` | admin token | refresh the Gemini catalog from Code Assist `fetchAvailableModels` |
 | `GET /admin/api/client-key` | admin token | retrieve the proxy key for `connect` |
 
 Every response carries `x-request-id`; logs are JSON (`RUST_LOG` filters, `--log-format json|pretty`) and each request logs the account (label) that served it.
@@ -173,7 +165,7 @@ Underclass accepts one hyphenated RFC4122 UUIDv4 and normalizes it to lowercase.
 
 ## Models
 
-The catalog is data, not code: seeded with the Codex families (`gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, `gpt-5.5`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-6-astra`, `gpt-6-sol`), Copilot's live `/models` list, the Claude families (`claude-haiku-5-5`, `claude-sonnet-5-5`, `claude-opus-5-5`, `claude-fable-5-1`, and the 5.x/4.x generations), refreshed live from Anthropic's `/v1/models` when a Claude account is added, the OpenCode Go models under `opencode-go/` (`opencode-go/kimi-k3`, `opencode-go/glm-5.3`, `opencode-go/deepseek-v4.1-flash`, …), refreshed from the gateway's live list on boot and when a key is added while keeping stored names and limits, and the Gemini families (`gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-3-pro-preview`, `gemini-3.1-pro-preview`, `gemma-4-31b-it`, …), refreshed from Code Assist when a Google account is added. Edit it in the UI or via the admin API; routing eligibility and the opencode model block follow it. Claude models are not part of the opencode provider block: the Anthropic surface is not OpenAI-shaped. See [ADR 0007](docs/adr/0007-config-driven-model-catalog.md).
+The catalog is data, not code: seeded with the Codex families (`gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, `gpt-5.5`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-6-astra`, `gpt-6-sol`), Copilot's live `/models` list, the Claude families (`claude-haiku-5-5`, `claude-sonnet-5-5`, `claude-opus-5-5`, `claude-fable-5-1`, and the 5.x/4.x generations), refreshed live from Anthropic's `/v1/models` when a Claude account is added, and the OpenCode Go models under `opencode-go/` (`opencode-go/kimi-k3`, `opencode-go/glm-5.3`, `opencode-go/deepseek-v4.1-flash`, …), refreshed from the gateway's live list on boot and when a key is added while keeping stored names and limits. Edit it in the UI or via the admin API; routing eligibility and the opencode model block follow it. Claude models are not part of the opencode provider block: the Anthropic surface is not OpenAI-shaped. See [ADR 0007](docs/adr/0007-config-driven-model-catalog.md).
 
 ## Nix flake
 
@@ -301,7 +293,6 @@ src/
   copilot.rs   GitHub Copilot backend (device flow, catalog, headers)
   claude.rs    Claude Code backend (PKCE paste-back flow, Anthropic surface)
   opencode_go.rs OpenCode Go backend (API-key enrollment, namespaced catalog, allowance windows)
-  gemini.rs    Gemini / Google AI Ultra backend (OAuth paste-back, Code Assist translation)
   tokens.rs    single-flight token refresh
   proxy.rs     /v1/* handlers, failover, streaming
   usage.rs     token + stream-outcome tap over upstream bodies

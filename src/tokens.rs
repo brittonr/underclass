@@ -35,7 +35,7 @@ pub fn rotation_due(account: &Account, now_ms: i64) -> bool {
 pub fn refreshes_with_issuer(backend: crate::models::BackendId) -> bool {
     use crate::models::BackendId;
     match backend {
-        BackendId::Codex | BackendId::Claude | BackendId::Gemini => true,
+        BackendId::Codex | BackendId::Claude => true,
         BackendId::Copilot | BackendId::OpencodeGo => false,
     }
 }
@@ -87,10 +87,11 @@ impl TokenManager {
     }
 
     /// @cc [owner:ghuntley,label:auth] proactive-refresh-margin
-    /// `access_token` MUST return the cached access token for Codex, Claude, and Gemini while it
-    /// remains valid beyond `PROACTIVE_REFRESH_MARGIN_MS` from expiry, and MUST force a refresh
-    /// otherwise. For Copilot it MUST return the stored GitHub token directly (it never expires or
-    /// refreshes), and for OpenCode Go the stored API key.
+    /// `access_token` MUST return the cached Codex access token while it remains valid beyond
+    /// `PROACTIVE_REFRESH_MARGIN_MS` from expiry, and MUST force a refresh otherwise. For Copilot
+    /// it MUST return the stored GitHub token directly (it never expires or refreshes), and for
+    /// OpenCode Go the stored API key. For Claude it MUST return the stored OAuth token while it
+    /// remains valid beyond the same margin, and MUST refresh it otherwise.
     pub async fn access_token(&self, account: &Account) -> Result<String, TokenError> {
         match account.backend {
             crate::models::BackendId::Copilot => account
@@ -103,9 +104,19 @@ impl TokenManager {
             crate::models::BackendId::OpencodeGo => {
                 account.access_token.clone().ok_or(TokenError::MissingToken)
             }
-            crate::models::BackendId::Codex
-            | crate::models::BackendId::Claude
-            | crate::models::BackendId::Gemini => {
+            crate::models::BackendId::Codex => {
+                if let Some(token) = &account.access_token {
+                    if account
+                        .expires_at
+                        .saturating_sub(PROACTIVE_REFRESH_MARGIN_MS)
+                        > now_ms()
+                    {
+                        return Ok(token.clone());
+                    }
+                }
+                self.force_refresh(&account.id).await
+            }
+            crate::models::BackendId::Claude => {
                 if let Some(token) = &account.access_token {
                     if account
                         .expires_at
@@ -123,10 +134,9 @@ impl TokenManager {
     /// @cc [owner:ghuntley,label:auth] force-refresh-single-flight-and-rotation
     /// `force_refresh` MUST serialize refreshes per account (single-flight lock), MUST NOT skip
     /// the refresh based on a still-valid cached token (callers rely on it to recover from 401),
-    /// and MUST persist the rotated refresh token, new access token, expiry, and
-    /// `token_refreshed_at` before returning the access token. A Codex refresh MUST also persist
-    /// any newly learned ChatGPT account id and residency. A Gemini refresh MUST keep the stored
-    /// Code Assist project id.
+    /// and MUST persist the rotated refresh token, new access token, expiry, `token_refreshed_at`,
+    /// and any newly learned ChatGPT account id/residency to the store before returning the access
+    /// token.
     pub async fn force_refresh(&self, account_id: &str) -> Result<String, TokenError> {
         let lock = self.lock_for(account_id).clone();
         let _guard = lock.lock().await;
@@ -179,27 +189,6 @@ impl TokenManager {
                 let expires_at = now_ms() + (tokens.expires_in.unwrap_or(3600) as i64) * 1000;
                 // The Anthropic refresh grant rotates the refresh token: persist the new one
                 // immediately or the account is left holding an invalidated credential.
-                self.store.update_tokens(
-                    account_id,
-                    tokens
-                        .refresh_token
-                        .as_deref()
-                        .or(Some(refresh_token.as_str())),
-                    Some(&tokens.access_token),
-                    expires_at,
-                    None,
-                    None,
-                );
-                Ok(tokens.access_token)
-            }
-            crate::models::BackendId::Gemini => {
-                let refresh_token = refresh_token()?;
-                let tokens = crate::gemini::refresh(&self.client, &refresh_token)
-                    .await
-                    .map_err(|e| TokenError::RefreshFailed(e.to_string()))?;
-                let expires_at = now_ms() + tokens.expires_in.saturating_mul(1_000);
-                // Google's refresh grant usually keeps the same refresh token. Passing `None`
-                // for the project id leaves the stored Code Assist project in place.
                 self.store.update_tokens(
                     account_id,
                     tokens

@@ -189,12 +189,9 @@ pub struct StartFlowBody {
     /// The Console API key of an OpenCode Go account. Never echoed.
     #[serde(default)]
     pub api_key: Option<String>,
-    /// Operator label for an OpenCode Go or Gemini account.
+    /// Operator label for an OpenCode Go account.
     #[serde(default)]
     pub label: Option<String>,
-    /// Google Cloud project id for a Gemini tier that requires one.
-    #[serde(default)]
-    pub project: Option<String>,
 }
 
 pub async fn start_flow(
@@ -242,16 +239,6 @@ pub async fn start_flow(
             )
             .await;
         }
-        BackendId::Gemini => crate::gemini::start_flow(
-            state.client.clone(),
-            state.store.clone(),
-            state.flows.clone(),
-            None,
-            body.project.clone(),
-            body.label.clone(),
-        )
-        .await
-        .map_err(|e| e.to_string()),
     };
     match result {
         Ok(flow_id) => {
@@ -347,58 +334,12 @@ pub struct FlowCodeBody {
 
 /// @cc [owner:ghuntley,label:security] claude-flow-code-never-echoed
 /// `submit_flow_code` MUST exchange the pasted authorization code for tokens and MUST NOT echo
-/// the code, the state, or any token back to the caller. A Gemini code MUST make the enrolled
-/// account routable and MUST report a free Code Assist tier as disabled.
+/// the code, the state, or any token back to the caller.
 pub async fn submit_flow_code(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<FlowCodeBody>,
 ) -> Response {
-    let Some(flow) = state.flows.get(&id) else {
-        return (StatusCode::NOT_FOUND, "unknown flow").into_response();
-    };
-    if flow.backend == BackendId::Gemini {
-        return match crate::gemini::submit_code(
-            &state.client,
-            &state.store,
-            &state.flows,
-            &id,
-            &body.code,
-        )
-        .await
-        {
-            Ok(account) => {
-                state.pool.lock().unwrap().sync_account(account.clone());
-                if let (Some(token), Some(project)) = (
-                    account.access_token.as_deref(),
-                    account.account_id.as_deref(),
-                ) && let Err(error) = crate::gemini::refresh_catalog(
-                    &state.client,
-                    &state.store,
-                    &state.pool,
-                    token,
-                    project,
-                )
-                .await
-                {
-                    tracing::warn!(error = %error, "gemini.catalog_refresh_failed");
-                }
-                Json(json!({
-                    "account_id": account.id,
-                    "label": account.label,
-                    "plan": account.plan,
-                    "account_status": account.status,
-                    "status": "authorized"
-                }))
-                .into_response()
-            }
-            Err(error) => (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": "flow_failed", "message": error.to_string() })),
-            )
-                .into_response(),
-        };
-    }
     match crate::claude::submit_code(
         state.client.clone(),
         state.store.clone(),
@@ -574,26 +515,6 @@ pub async fn relogin_account(
             let replacement: ReloginBody = serde_json::from_slice(&body).unwrap_or_default();
             return enroll_opencode_go(&state, Some(&id), replacement.api_key.as_deref(), None)
                 .await;
-        }
-        BackendId::Gemini => {
-            let replacement: StartFlowBody =
-                serde_json::from_slice(&body).unwrap_or(StartFlowBody {
-                    backend: "gemini".into(),
-                    enterprise_url: None,
-                    api_key: None,
-                    label: None,
-                    project: account.account_id.clone(),
-                });
-            crate::gemini::start_flow(
-                state.client.clone(),
-                state.store.clone(),
-                state.flows.clone(),
-                Some(id.clone()),
-                replacement.project.or(account.account_id.clone()),
-                replacement.label,
-            )
-            .await
-            .map_err(|e| e.to_string())
         }
     };
     match result {
@@ -808,50 +729,6 @@ pub async fn refresh_opencode_go_catalog(State(state): State<Arc<AppState>>) -> 
     Json(json!({
         "refreshed_accounts": usize::from(models.is_some()),
         "models": models.unwrap_or(0),
-        "errors": errors,
-    }))
-    .into_response()
-}
-
-/// Refreshes the Gemini catalog from Code Assist, using the first enabled account that has a
-/// project id. A failed fetch leaves the stored catalog in place.
-pub async fn refresh_gemini_catalog(State(state): State<Arc<AppState>>) -> Response {
-    let mut errors = Vec::new();
-    let mut models = 0usize;
-    for account in state.store.list_accounts() {
-        if account.backend != BackendId::Gemini || account.status == AccountStatus::Disabled {
-            continue;
-        }
-        let Some(project) = account.account_id.clone() else {
-            continue;
-        };
-        let token = match state.tokens.access_token(&account).await {
-            Ok(token) => token,
-            Err(error) => {
-                errors.push(format!("{}: {error}", account.label));
-                continue;
-            }
-        };
-        match crate::gemini::refresh_catalog(
-            &state.client,
-            &state.store,
-            &state.pool,
-            &token,
-            &project,
-        )
-        .await
-        {
-            Ok(count) if count > 0 => {
-                models = count;
-                break;
-            }
-            Ok(_) => errors.push(format!("{}: model list was empty", account.label)),
-            Err(error) => errors.push(format!("{}: {error}", account.label)),
-        }
-    }
-    Json(json!({
-        "refreshed_accounts": usize::from(models > 0),
-        "models": models,
         "errors": errors,
     }))
     .into_response()

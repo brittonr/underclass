@@ -1,7 +1,7 @@
 use underclass::provider::BackendMap;
 use underclass::{
-    claude, cli, codex, config, copilot, flows, gemini, logging, models, monitor, opencode_go,
-    pool, proxy, stats_api, store, tokens, top, ui,
+    claude, cli, codex, config, copilot, flows, logging, models, monitor, opencode_go, pool, proxy,
+    stats_api, store, tokens, top, ui,
 };
 
 use clap::{Parser, Subcommand};
@@ -21,8 +21,6 @@ const STATS_TICK: std::time::Duration = std::time::Duration::from_secs(900);
 const CLAUDE_USAGE_POLL: std::time::Duration = std::time::Duration::from_secs(120);
 /// How often the OpenCode Go accounts' allowance windows are polled.
 const OPENCODE_GO_USAGE_POLL: std::time::Duration = std::time::Duration::from_secs(120);
-/// How often Gemini Code Assist quota buckets are polled for the admin UI.
-const GEMINI_QUOTA_POLL: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Parser)]
 #[command(
@@ -63,11 +61,6 @@ enum Command {
         #[clap(flatten)]
         args: cli::RefreshArgs,
     },
-    /// add a Google AI Ultra account through the running server's paste-back OAuth flow
-    Login {
-        #[clap(flatten)]
-        args: cli::LoginArgs,
-    },
     /// show token, session, concurrency, capacity, and refusal statistics from the running server
     Stats {
         #[clap(flatten)]
@@ -82,7 +75,6 @@ fn main() {
         Some(Command::Top { .. })
             | Some(Command::Reset { .. })
             | Some(Command::Refresh { .. })
-            | Some(Command::Login { .. })
             | Some(Command::Stats { .. })
     ) {
         logging::init(cli.log_format);
@@ -111,12 +103,6 @@ fn main() {
         }
         Some(Command::Refresh { args }) => {
             if let Err(e) = cli::refresh(&args) {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::Login { args }) => {
-            if let Err(e) = cli::login(&args) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -187,7 +173,6 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         models::BackendId::OpencodeGo,
         opencode_go::default_catalog(),
     );
-    seed_catalog(&store, models::BackendId::Gemini, gemini::default_catalog());
 
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -218,12 +203,6 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         models::BackendId::OpencodeGo,
         Arc::new(opencode_go::OpencodeGoBackend {
             cooldown_ms: cfg.opencode_go_cooldown_ms,
-        }),
-    );
-    backends.insert(
-        models::BackendId::Gemini,
-        Arc::new(gemini::GeminiBackend {
-            cooldown_ms: cfg.gemini_cooldown_ms,
         }),
     );
     // The pool learns which surfaces each backend serves from the backends themselves.
@@ -301,7 +280,6 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
     refresh_copilot_catalogs_on_boot(&state).await;
     refresh_claude_catalogs_on_boot(&state).await;
     refresh_opencode_go_catalog_on_boot(&state).await;
-    refresh_gemini_catalog_on_boot(&state).await;
     refresh_identities_on_boot(&state).await;
     {
         let state = state.clone();
@@ -318,15 +296,6 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
             loop {
                 poll_opencode_go_usage(&state).await;
                 tokio::time::sleep(OPENCODE_GO_USAGE_POLL).await;
-            }
-        });
-    }
-    {
-        let state = state.clone();
-        tokio::spawn(async move {
-            loop {
-                poll_gemini_quota(&state).await;
-                tokio::time::sleep(GEMINI_QUOTA_POLL).await;
             }
         });
     }
@@ -447,10 +416,6 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         .route(
             "/admin/api/catalog/refresh-opencode-go",
             axum::routing::post(ui::refresh_opencode_go_catalog),
-        )
-        .route(
-            "/admin/api/catalog/refresh-gemini",
-            axum::routing::post(ui::refresh_gemini_catalog),
         )
         .route("/admin/api/client-key", axum::routing::get(ui::client_key))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -778,67 +743,6 @@ async fn poll_opencode_go_usage(state: &Arc<proxy::AppState>) {
     }
 }
 
-/// Polls each Gemini account's Code Assist quota buckets for the admin UI.
-///
-/// The buckets are observations only. A bucket at zero does not cool the account: only an
-/// upstream 429 or `RESOURCE_EXHAUSTED` does, because the bucket schema was not verified live.
-async fn poll_gemini_quota(state: &Arc<proxy::AppState>) {
-    let accounts: Vec<models::Account> = state
-        .store
-        .list_accounts()
-        .into_iter()
-        .filter(|account| account.backend == models::BackendId::Gemini)
-        .filter(|account| account.status != models::AccountStatus::Disabled)
-        .collect();
-    for account in accounts {
-        let Some(project) = account.account_id.clone() else {
-            continue;
-        };
-        let result = match state.tokens.access_token(&account).await {
-            Ok(token) => gemini::fetch_quota(&state.client, &token, &project).await,
-            Err(error) => Err(error.to_string()),
-        };
-        match result {
-            Ok(buckets) => {
-                state
-                    .observations
-                    .lock()
-                    .unwrap()
-                    .insert(account.id.clone(), gemini::quota_view(&buckets));
-            }
-            Err(error) => {
-                logging::log_account_state(
-                    &account.id,
-                    Some(&account.label),
-                    "usage_poll_failed",
-                    &error,
-                );
-            }
-        }
-    }
-}
-
-async fn refresh_gemini_catalog_on_boot(state: &Arc<proxy::AppState>) {
-    let Some(account) = state.store.list_accounts().into_iter().find(|account| {
-        account.backend == models::BackendId::Gemini
-            && account.status != models::AccountStatus::Disabled
-            && account.account_id.is_some()
-    }) else {
-        return;
-    };
-    let Some(project) = account.account_id.clone() else {
-        return;
-    };
-    let Ok(token) = state.tokens.access_token(&account).await else {
-        return;
-    };
-    if let Err(error) =
-        gemini::refresh_catalog(&state.client, &state.store, &state.pool, &token, &project).await
-    {
-        tracing::warn!(error = %error, "gemini.catalog_refresh_failed");
-    }
-}
-
 /// @cc [owner:ghuntley,label:pool] plan-gate-operator-serialization
 /// Plan-gate decisions MUST read current account metadata and persist status under the pool
 /// lock, in pool -> store order. Only a disable attributed to the plan gate MAY be reversed;
@@ -872,7 +776,7 @@ fn enforce_plan_gates(state: &Arc<proxy::AppState>) {
 }
 
 fn is_generic_label(label: &str) -> bool {
-    matches!(label, "chatgpt" | "github" | "claude" | "gemini") || label.trim().is_empty()
+    matches!(label, "chatgpt" | "github" | "claude") || label.trim().is_empty()
 }
 
 /// @cc [owner:ghuntley,label:auth] scheduled-rotation-never-bricks-account
@@ -940,8 +844,6 @@ async fn refresh_identities_on_boot(state: &Arc<proxy::AppState>) {
             }
             // An OpenCode Go key carries no identity beyond the label it was enrolled with.
             models::BackendId::OpencodeGo => continue,
-            // A Gemini account is labeled with the Google email at enrollment.
-            models::BackendId::Gemini => continue,
         };
         let Some(identity) = identity else {
             continue;

@@ -9,8 +9,6 @@ pub enum BackendId {
     /// OpenCode Go subscriptions, authenticated with a Console API key.
     #[serde(rename = "opencode-go")]
     OpencodeGo,
-    /// Google AI Ultra / Gemini Code Assist subscriptions, authenticated with Google OAuth.
-    Gemini,
 }
 
 impl BackendId {
@@ -20,7 +18,6 @@ impl BackendId {
             BackendId::Copilot => "copilot",
             BackendId::Claude => "claude",
             BackendId::OpencodeGo => "opencode-go",
-            BackendId::Gemini => "gemini",
         }
     }
 
@@ -30,21 +27,17 @@ impl BackendId {
             "copilot" => Some(BackendId::Copilot),
             "claude" => Some(BackendId::Claude),
             "opencode-go" => Some(BackendId::OpencodeGo),
-            "gemini" => Some(BackendId::Gemini),
             _ => None,
         }
     }
 
     /// Every backend, in the stable order the unknown-model fallback consults (ADR 0024).
-    /// Gemini is last so an unknown model still falls through to Codex on the OpenAI surface
-    /// and Claude on the Anthropic surface.
-    pub fn all() -> [BackendId; 5] {
+    pub fn all() -> [BackendId; 4] {
         [
             BackendId::Codex,
             BackendId::Copilot,
             BackendId::Claude,
             BackendId::OpencodeGo,
-            BackendId::Gemini,
         ]
     }
 }

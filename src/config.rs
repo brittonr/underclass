@@ -12,8 +12,6 @@ pub struct FileConfig {
     pub claude_cooldown_ms: Option<u64>,
     pub opencode_go_cooldown_secs: Option<u64>,
     pub opencode_go_cooldown_ms: Option<u64>,
-    pub gemini_cooldown_secs: Option<u64>,
-    pub gemini_cooldown_ms: Option<u64>,
     pub copilot_cooldown_ms: Option<u64>,
     pub codex_cooldown_ms: Option<u64>,
     pub auto_codex_resets: Option<bool>,
@@ -30,7 +28,6 @@ pub struct Config {
     pub copilot_cooldown_ms: i64,
     pub claude_cooldown_ms: i64,
     pub opencode_go_cooldown_ms: i64,
-    pub gemini_cooldown_ms: i64,
     pub stats_retention_days: i64,
     pub data_dir: PathBuf,
     #[allow(dead_code)]
@@ -38,14 +35,6 @@ pub struct Config {
 }
 
 pub const DEFAULT_COOLDOWN_MS: i64 = 30 * 60 * 1000;
-
-/// @cc [owner:ghuntley,label:config] cooldown-ms-overrides-secs
-/// `resolve_cooldown` MUST return `ms` when it is set, otherwise `secs` converted to
-/// milliseconds, and otherwise `DEFAULT_COOLDOWN_MS`.
-pub fn resolve_cooldown(ms: Option<u64>, secs: Option<u64>) -> i64 {
-    ms.or_else(|| secs.map(|secs| secs.saturating_mul(1000)))
-        .unwrap_or(DEFAULT_COOLDOWN_MS as u64) as i64
-}
 pub const SYSTEM_MONITOR_SOCKET: &str = "/run/underclass/monitor.sock";
 
 fn home_dir() -> PathBuf {
@@ -94,18 +83,22 @@ impl Config {
         let ui_token = std::env::var("UNDERCLASS_UI_TOKEN")
             .ok()
             .or(file_cfg.ui_token);
-        let codex_cooldown_ms =
-            resolve_cooldown(file_cfg.codex_cooldown_ms, file_cfg.codex_cooldown_secs);
-        let copilot_cooldown_ms =
-            resolve_cooldown(file_cfg.copilot_cooldown_ms, file_cfg.copilot_cooldown_secs);
-        let claude_cooldown_ms =
-            resolve_cooldown(file_cfg.claude_cooldown_ms, file_cfg.claude_cooldown_secs);
-        let opencode_go_cooldown_ms = resolve_cooldown(
-            file_cfg.opencode_go_cooldown_ms,
-            file_cfg.opencode_go_cooldown_secs,
-        );
-        let gemini_cooldown_ms =
-            resolve_cooldown(file_cfg.gemini_cooldown_ms, file_cfg.gemini_cooldown_secs);
+        let codex_cooldown_ms = file_cfg
+            .codex_cooldown_ms
+            .or(file_cfg.codex_cooldown_secs.map(|s| s * 1000))
+            .unwrap_or(DEFAULT_COOLDOWN_MS as u64) as i64;
+        let copilot_cooldown_ms = file_cfg
+            .copilot_cooldown_ms
+            .or(file_cfg.copilot_cooldown_secs.map(|s| s * 1000))
+            .unwrap_or(DEFAULT_COOLDOWN_MS as u64) as i64;
+        let claude_cooldown_ms = file_cfg
+            .claude_cooldown_ms
+            .or(file_cfg.claude_cooldown_secs.map(|s| s * 1000))
+            .unwrap_or(DEFAULT_COOLDOWN_MS as u64) as i64;
+        let opencode_go_cooldown_ms = file_cfg
+            .opencode_go_cooldown_ms
+            .or(file_cfg.opencode_go_cooldown_secs.map(|s| s * 1000))
+            .unwrap_or(DEFAULT_COOLDOWN_MS as u64) as i64;
 
         let auto_codex_resets = std::env::var("UNDERCLASS_AUTO_CODEX_RESETS")
             .ok()
@@ -129,7 +122,6 @@ impl Config {
             copilot_cooldown_ms,
             claude_cooldown_ms,
             opencode_go_cooldown_ms,
-            gemini_cooldown_ms,
             stats_retention_days,
             data_dir,
             config_dir,
@@ -148,22 +140,5 @@ impl Config {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| self.data_dir.join("monitor.sock"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gemini_cooldown_prefers_milliseconds_then_seconds() {
-        assert_eq!(resolve_cooldown(Some(1_500), Some(90)), 1_500);
-        assert_eq!(resolve_cooldown(None, Some(90)), 90_000);
-        assert_eq!(resolve_cooldown(None, None), DEFAULT_COOLDOWN_MS);
-        let parsed: FileConfig = toml::from_str("gemini_cooldown_secs = 90\n").unwrap();
-        assert_eq!(
-            resolve_cooldown(parsed.gemini_cooldown_ms, parsed.gemini_cooldown_secs),
-            90_000
-        );
     }
 }

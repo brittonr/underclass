@@ -1,7 +1,6 @@
 use hegel::TestCase;
 use hegel::generators as gs;
 use std::collections::HashMap;
-use underclass::gemini::{from_code_assist, parse_duration_ms, quota_until_ms, to_code_assist};
 use underclass::models::{Account, AccountStatus, BackendId, ModelInfo, Outcome, Surface};
 use underclass::opencode_go::{catalog_id, merge_catalog, upstream_model};
 use underclass::pool::{PoolCore, SelectError};
@@ -1240,63 +1239,4 @@ fn test_opencode_go_catalog_merge_keeps_one_entry_per_live_id(tc: TestCase) {
             assert_eq!(model.name, upstream_model(&model.id), "fallback name");
         }
     }
-}
-
-/// A chat user's text survives translation into Code Assist and back out, including an empty
-/// string, and the request never gains a credential field.
-#[hegel::test]
-fn test_gemini_chat_text_survives_translation(tc: TestCase) {
-    let text: String = tc.draw(gs::text());
-    let body = serde_json::json!({
-        "model": "gemini-2.5-pro",
-        "messages": [{"role": "user", "content": text}]
-    });
-    let upstream = to_code_assist("/chat/completions", &body, Some("proj"), Some("sess"));
-    assert_eq!(
-        upstream
-            .pointer("/request/contents/0/parts/0/text")
-            .and_then(|v| v.as_str()),
-        Some(text.as_str())
-    );
-    assert_eq!(upstream["project"], "proj");
-    assert_eq!(upstream["request"]["session_id"], "sess");
-    assert!(upstream.get("authorization").is_none());
-    let response = serde_json::json!({
-        "response": {
-            "candidates": [{
-                "content": {"parts": [{"text": text}]},
-                "finishReason": "STOP"
-            }],
-            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2}
-        }
-    });
-    let back = from_code_assist("/chat/completions", &body, &response);
-    assert_eq!(
-        back.pointer("/choices/0/message/content")
-            .and_then(|v| v.as_str()),
-        Some(text.as_str())
-    );
-    assert!(back.get("project").is_none());
-}
-
-/// A `Ns` retry delay is N thousand milliseconds, and a quota deadline is that delay after now.
-#[hegel::test]
-fn test_gemini_retry_delay_is_absolute(tc: TestCase) {
-    let secs: i64 = tc.draw(gs::integers::<i64>().min_value(0).max_value(86_400));
-    let now: i64 = tc.draw(
-        gs::integers::<i64>()
-            .min_value(0)
-            .max_value(1_000_000_000_000),
-    );
-    assert_eq!(
-        parse_duration_ms(&format!("{secs}s")),
-        Some(secs.saturating_mul(1000))
-    );
-    let body = format!(
-        r#"{{"error":{{"status":"RESOURCE_EXHAUSTED","details":[{{"retryDelay":"{secs}s"}}]}}}}"#
-    );
-    assert_eq!(
-        quota_until_ms(429, &body, &http::HeaderMap::new(), 30_000, now),
-        Some(now.saturating_add(secs.saturating_mul(1000)))
-    );
 }
