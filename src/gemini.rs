@@ -44,12 +44,59 @@ const SCOPES: &[&str] = &[
 const DEFAULT_CONTEXT: i64 = 1_048_576;
 const DEFAULT_OUTPUT: i64 = 65_536;
 
+const ERROR_BODY_LIMIT: usize = 2 * 1024;
+const REDACTED: &str = "[redacted]";
+
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
-    #[error("gemini authorization failed (HTTP {0})")]
-    Rejected(u16),
+    /// A non-success response from Google. `status` is the HTTP status; the display also names
+    /// the method and Google's error message, status, and reasons when the body has them.
+    #[error("{0}")]
+    Rejected(UpstreamRejection),
     #[error("{0}")]
     Failed(String),
+}
+
+/// A non-success Google response, reduced to the fields that explain the refusal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpstreamRejection {
+    pub status: u16,
+    pub method: String,
+    pub message: Option<String>,
+    pub error_status: Option<String>,
+    pub reasons: Vec<String>,
+}
+
+impl std::fmt::Display for UpstreamRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "gemini authorization failed (HTTP {}) during {}",
+            self.status, self.method
+        )?;
+        if let Some(status) = &self.error_status {
+            write!(formatter, ": {status}")?;
+        }
+        if let Some(message) = &self.message {
+            if self.error_status.is_some() {
+                write!(formatter, "; {message}")?;
+            } else {
+                write!(formatter, ": {message}")?;
+            }
+        }
+        if !self.reasons.is_empty() {
+            write!(formatter, " (reason: {})", self.reasons.join(", "))?;
+        }
+        Ok(())
+    }
+}
+
+/// Fields pulled out of a Google error body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedUpstreamError {
+    pub message: Option<String>,
+    pub status: Option<String>,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1894,18 +1941,200 @@ impl ResponseAdapter for GeminiTranslator {
     }
 }
 
-async fn read_token(response: reqwest::Response) -> Result<TokenPair, AuthError> {
-    let status = response.status();
-    let body: Value = response.json().await.unwrap_or(Value::Null);
-    if !status.is_success() {
-        let code = body
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("rejected");
-        return Err(AuthError::Failed(format!(
-            "token endpoint rejected the grant ({code})"
-        )));
+fn truncate_body(raw: &str) -> String {
+    if raw.len() <= ERROR_BODY_LIMIT {
+        return raw.to_string();
     }
+    let mut end = ERROR_BODY_LIMIT;
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    raw[..end].to_string()
+}
+
+fn credential_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase().replace('-', "_");
+    matches!(
+        key.as_str(),
+        "access_token"
+            | "refresh_token"
+            | "id_token"
+            | "client_secret"
+            | "code_verifier"
+            | "authorization"
+    )
+}
+
+fn looks_like_auth_code(key: &str, value: &str) -> bool {
+    key.eq_ignore_ascii_case("code") && value.len() > 20 && !value.contains(' ')
+}
+
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b'+' | b'=')
+}
+
+/// Replaces Google access tokens, refresh tokens, and bearer credentials inside free text.
+fn scrub_token_text(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let rest = &text[index..];
+        let marker = if rest.starts_with("ya29.") {
+            Some(5)
+        } else if rest.starts_with("1//") {
+            Some(3)
+        } else if rest.starts_with("Bearer ") || rest.starts_with("bearer ") {
+            Some(7)
+        } else {
+            None
+        };
+        if let Some(prefix) = marker {
+            let mut end = index + prefix;
+            while end < bytes.len() && is_token_byte(bytes[end]) {
+                end += 1;
+            }
+            if rest.starts_with("Bearer ") || rest.starts_with("bearer ") {
+                out.push_str("Bearer ");
+            }
+            out.push_str(REDACTED);
+            index = end;
+            continue;
+        }
+        let ch = rest.chars().next().unwrap_or('\u{FFFD}');
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+fn redact_json(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if credential_key(key)
+                    || child
+                        .as_str()
+                        .is_some_and(|text| looks_like_auth_code(key, text))
+                {
+                    *child = Value::String(REDACTED.to_string());
+                } else {
+                    redact_json(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_json(item);
+            }
+        }
+        Value::String(text) => {
+            let scrubbed = scrub_token_text(text);
+            if scrubbed != *text {
+                *text = scrubbed;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// @cc [owner:ghuntley,label:security] gemini-upstream-error-redacted
+/// `redact_upstream_body` MUST keep at most 2048 bytes, cut on a char boundary, and MUST replace
+/// access tokens, refresh tokens, bearer credentials, client secrets, and authorization codes
+/// with `[redacted]`. A numeric `error.code` MUST be left unchanged.
+pub fn redact_upstream_body(raw: &str) -> String {
+    let truncated = truncate_body(raw);
+    if let Ok(mut value) = serde_json::from_str::<Value>(&truncated) {
+        redact_json(&mut value);
+        return value.to_string();
+    }
+    scrub_token_text(&truncated)
+}
+
+/// @cc [owner:ghuntley,label:auth] gemini-upstream-error-fields
+/// `parse_upstream_error` MUST, when `error` is an object, return its `message`, its `status`,
+/// and every `details[].reason`. When `error` is a string it MUST return that string as the
+/// status and `error_description` as the message. Missing fields MUST be absent. Every returned
+/// string MUST already have secrets removed by `redact_upstream_body`.
+pub fn parse_upstream_error(raw: &str) -> ParsedUpstreamError {
+    let safe = redact_upstream_body(raw);
+    let Ok(value) = serde_json::from_str::<Value>(&safe) else {
+        return ParsedUpstreamError {
+            message: None,
+            status: None,
+            reasons: Vec::new(),
+        };
+    };
+    let Some(error) = value.get("error") else {
+        return ParsedUpstreamError {
+            message: None,
+            status: None,
+            reasons: Vec::new(),
+        };
+    };
+    match error {
+        Value::String(code) => ParsedUpstreamError {
+            message: value
+                .get("error_description")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            status: Some(code.clone()),
+            reasons: Vec::new(),
+        },
+        Value::Object(object) => ParsedUpstreamError {
+            message: object
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            status: object
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            reasons: object
+                .get("details")
+                .and_then(Value::as_array)
+                .map(|details| {
+                    details
+                        .iter()
+                        .filter_map(|detail| detail.get("reason").and_then(Value::as_str))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        },
+        _ => ParsedUpstreamError {
+            message: None,
+            status: None,
+            reasons: Vec::new(),
+        },
+    }
+}
+
+fn upstream_rejection(method: &str, status: u16, body: &str) -> AuthError {
+    let safe = redact_upstream_body(body);
+    tracing::warn!(
+        method,
+        status,
+        body = %safe,
+        "gemini.upstream_rejected"
+    );
+    let parsed = parse_upstream_error(body);
+    AuthError::Rejected(UpstreamRejection {
+        status,
+        method: method.to_string(),
+        message: parsed.message,
+        error_status: parsed.status,
+        reasons: parsed.reasons,
+    })
+}
+
+async fn read_token(response: reqwest::Response, method: &str) -> Result<TokenPair, AuthError> {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(upstream_rejection(method, status.as_u16(), &body));
+    }
+    let body: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
     let access_token = body
         .get("access_token")
         .and_then(Value::as_str)
@@ -1936,7 +2165,7 @@ pub async fn exchange(client: &Client, code: &str, verifier: &str) -> Result<Tok
         .send()
         .await
         .map_err(|_| AuthError::Failed("token endpoint unreachable".into()))?;
-    read_token(response).await
+    read_token(response, "exchange").await
 }
 
 pub async fn refresh(client: &Client, refresh_token: &str) -> Result<TokenPair, AuthError> {
@@ -1947,7 +2176,7 @@ pub async fn refresh(client: &Client, refresh_token: &str) -> Result<TokenPair, 
         .send()
         .await
         .map_err(|_| AuthError::Failed("token endpoint unreachable".into()))?;
-    read_token(response).await
+    read_token(response, "refresh").await
 }
 
 async fn code_assist(
@@ -1966,7 +2195,8 @@ async fn code_assist(
         .map_err(|_| AuthError::Failed("code assist request failed".into()))?;
     let status = response.status();
     if !status.is_success() {
-        return Err(AuthError::Rejected(status.as_u16()));
+        let body = response.text().await.unwrap_or_default();
+        return Err(upstream_rejection(method, status.as_u16(), &body));
     }
     response
         .json()
@@ -2112,7 +2342,9 @@ async fn setup_user(
             .await
             .map_err(|_| AuthError::Failed("code assist operation failed".into()))?;
         if !response.status().is_success() {
-            return Err(AuthError::Rejected(response.status().as_u16()));
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(upstream_rejection("getOperation", status, &body));
         }
         operation = response
             .json()
@@ -2147,7 +2379,9 @@ pub async fn fetch_models(
         .map_err(|_| "model list request failed".to_string())?;
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("model list returned {}", status.as_u16()));
+        let code = status.as_u16();
+        let body = response.text().await.unwrap_or_default();
+        return Err(upstream_rejection("fetchAvailableModels", code, &body).to_string());
     }
     let body: Value = response
         .json()
@@ -2191,7 +2425,9 @@ pub async fn fetch_quota(
         .map_err(|_| "quota request failed".to_string())?;
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("quota request returned {}", status.as_u16()));
+        let code = status.as_u16();
+        let body = response.text().await.unwrap_or_default();
+        return Err(upstream_rejection("retrieveUserQuota", code, &body).to_string());
     }
     let body: Value = response
         .json()
@@ -2809,5 +3045,82 @@ mod tests {
         assert!(once.ends_with("/v1internal:generateContent"));
         let count = backend.upstream_url("/messages/count_tokens", &account, &json!({}));
         assert!(count.ends_with("/v1internal:countTokens"));
+    }
+
+    #[test]
+    fn upstream_error_body_keeps_google_fields_and_drops_secrets() {
+        let body = r#"{
+            "error": {
+                "code": 403,
+                "message": "blocked ya29.SUPERSECRETTOKEN",
+                "status": "PERMISSION_DENIED",
+                "details": [
+                    {"reason": "CONSUMER_INVALID"},
+                    {"reason": "ACCESS_TOKEN_SCOPE_INSUFFICIENT"}
+                ]
+            },
+            "access_token": "ya29.ACCESSVALUE",
+            "refresh_token": "1//REFRESHTOKENVALUE",
+            "code": "4/0AeaYSHthisisanauthorizationcodevalue"
+        }"#;
+        let parsed = parse_upstream_error(body);
+        assert_eq!(parsed.status.as_deref(), Some("PERMISSION_DENIED"));
+        assert_eq!(
+            parsed.reasons,
+            vec![
+                "CONSUMER_INVALID".to_string(),
+                "ACCESS_TOKEN_SCOPE_INSUFFICIENT".to_string()
+            ]
+        );
+        let message = parsed.message.expect("message");
+        assert!(message.contains("blocked"));
+        assert!(message.contains("[redacted]"));
+        assert!(!message.contains("SUPERSECRETTOKEN"));
+
+        let safe = redact_upstream_body(body);
+        assert!(!safe.contains("SUPERSECRETTOKEN"));
+        assert!(!safe.contains("ya29.ACCESSVALUE"));
+        assert!(!safe.contains("1//REFRESHTOKENVALUE"));
+        assert!(!safe.contains("4/0AeaYSH"));
+        let value: Value = serde_json::from_str(&safe).unwrap();
+        assert_eq!(value["error"]["code"], 403);
+        assert_eq!(value["access_token"], "[redacted]");
+        assert_eq!(value["refresh_token"], "[redacted]");
+        assert_eq!(value["code"], "[redacted]");
+
+        let oauth = r#"{"error":"invalid_grant","error_description":"token expired"}"#;
+        let parsed = parse_upstream_error(oauth);
+        assert_eq!(parsed.status.as_deref(), Some("invalid_grant"));
+        assert_eq!(parsed.message.as_deref(), Some("token expired"));
+        assert!(parsed.reasons.is_empty());
+
+        let missing = parse_upstream_error("not json");
+        assert_eq!(missing.message, None);
+        assert!(missing.reasons.is_empty());
+
+        let rejection = upstream_rejection("loadCodeAssist", 403, body);
+        let text = rejection.to_string();
+        assert!(text.contains("gemini authorization failed (HTTP 403)"));
+        assert!(text.contains("loadCodeAssist"));
+        assert!(text.contains("PERMISSION_DENIED"));
+        assert!(text.contains("CONSUMER_INVALID"));
+        assert!(text.contains("ACCESS_TOKEN_SCOPE_INSUFFICIENT"));
+        assert!(!text.contains("SUPERSECRETTOKEN"));
+        assert!(!text.contains("ya29.ACCESSVALUE"));
+        assert!(!text.contains("1//REFRESHTOKENVALUE"));
+        match rejection {
+            AuthError::Rejected(rejection) => {
+                assert_eq!(rejection.status, 403);
+                assert_eq!(rejection.method, "loadCodeAssist");
+            }
+            other => panic!("expected a rejection, got {other}"),
+        }
+
+        let mut huge = r#"{"error":{"message":"nope","status":"PERMISSION_DENIED"}}"#.to_string();
+        huge.push_str(&"x".repeat(3000));
+        huge.push_str("TAILMARKER");
+        let truncated = redact_upstream_body(&huge);
+        assert!(truncated.len() <= ERROR_BODY_LIMIT);
+        assert!(!truncated.contains("TAILMARKER"));
     }
 }
