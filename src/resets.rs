@@ -27,10 +27,24 @@ pub struct RateLimit {
     pub secondary_window: Option<Window>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UsageCredits {
+    pub has_credits: Option<bool>,
+    pub unlimited: Option<bool>,
+    pub overage_limit_reached: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SpendControl {
+    pub reached: Option<bool>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct UsageResponse {
     account_id: Option<String>,
     rate_limit: Option<RateLimit>,
+    credits: Option<UsageCredits>,
+    spend_control: Option<SpendControl>,
     rate_limit_reset_credits: Option<CreditCount>,
 }
 
@@ -94,7 +108,7 @@ pub struct ManualResetOutcome {
 pub enum ManualResetError {
     /// Only ChatGPT/Codex accounts bank reset credits.
     NotCodex,
-    /// Upstream reports ordinary usage allowed; redeeming would waste the credit.
+    /// Included or credit-backed usage is available.
     NotRateLimited,
     /// A redemption already completed for this outage and upstream has not reopened usage.
     AlreadyRedeemed,
@@ -119,7 +133,7 @@ impl ManualResetError {
         match self {
             ManualResetError::NotCodex => "only ChatGPT/Codex accounts have banked resets".into(),
             ManualResetError::NotRateLimited => {
-                "upstream reports this account is not rate limited; use force to redeem anyway".into()
+                "upstream allows included or credit-backed usage. Use force to redeem anyway".into()
             }
             ManualResetError::AlreadyRedeemed => {
                 "a reset was already redeemed for this outage and upstream has not reopened usage; use force to redeem another".into()
@@ -133,9 +147,32 @@ impl ManualResetError {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct UsageSnapshot {
     pub rate_limit: Option<RateLimit>,
+    #[serde(default)]
+    pub credits: Option<UsageCredits>,
+    #[serde(default)]
+    pub spend_control: Option<SpendControl>,
     pub available_resets: i64,
     pub credit_expirations: Vec<Option<i64>>,
     pub fetched_at_ms: i64,
+}
+
+impl UsageSnapshot {
+    /// @cc [owner:ghuntley,label:pool] codex-credit-aware-admission
+    /// Included usage MUST remain available despite a credit or spend limit.
+    /// The proxy MUST allow credit-backed usage only with credit or unlimited access and no explicit credit or spend block.
+    /// Missing credit metadata MUST NOT grant credit-backed access.
+    fn allows_usage(&self) -> bool {
+        if self.rate_limit.as_ref().and_then(|limit| limit.allowed) == Some(true) {
+            return true;
+        }
+        self.credits.as_ref().is_some_and(|credits| {
+            (credits.has_credits == Some(true) || credits.unlimited == Some(true))
+                && credits.overage_limit_reached != Some(true)
+        }) && self
+            .spend_control
+            .as_ref()
+            .is_none_or(|control| control.reached != Some(true))
+    }
 }
 
 /// @cc [owner:ghuntley,label:pool] natural-recovery-ranking
@@ -272,6 +309,9 @@ impl ResetManager {
         self.snapshots.lock().unwrap().get(account_id).cloned()
     }
 
+    /// @cc [owner:ghuntley,label:pool] codex-poll-credit-recovery
+    /// Usage polls MUST preserve Disabled and AuthError states.
+    /// Credit-backed access MUST restore a Cooling account without a reset redemption.
     pub async fn poll_account(
         &self,
         account: &Account,
@@ -284,20 +324,22 @@ impl ResetManager {
         }
         match self.fetch_usage(account, tokens).await {
             Ok(usage) => {
-                if let Some(limit) = &usage.rate_limit {
-                    if limit.allowed == Some(true) {
-                        store.clear_reset_attempt(&account.id);
-                        set_status_if(
-                            pool,
-                            store,
-                            &account.id,
-                            AccountStatus::Cooling,
-                            AccountStatus::Healthy,
-                            0,
-                        );
-                    } else if let Some(recovery) = natural_recovery_ms(limit, now_ms()) {
-                        cool_until_if_later(pool, store, &account.id, recovery);
-                    }
+                if usage.allows_usage() {
+                    store.clear_reset_attempt(&account.id);
+                    set_status_if(
+                        pool,
+                        store,
+                        &account.id,
+                        AccountStatus::Cooling,
+                        AccountStatus::Healthy,
+                        0,
+                    );
+                } else if let Some(recovery) = usage
+                    .rate_limit
+                    .as_ref()
+                    .and_then(|limit| natural_recovery_ms(limit, now_ms()))
+                {
+                    cool_until_if_later(pool, store, &account.id, recovery);
                 }
                 if usage.available_resets > 0
                     && let Err(reason) = self.fetch_credits(account, tokens).await
@@ -346,6 +388,8 @@ impl ResetManager {
             .map_or(0, |c| c.available_count.max(0));
         let snapshot = UsageSnapshot {
             rate_limit: usage.rate_limit,
+            credits: usage.credits,
+            spend_control: usage.spend_control,
             available_resets,
             credit_expirations: if available_resets > 0 {
                 self.snapshot(&account.id)
@@ -502,7 +546,7 @@ impl ResetManager {
                     continue;
                 }
             };
-            if usage.rate_limit.as_ref().and_then(|r| r.allowed) == Some(true) {
+            if usage.allows_usage() {
                 set_status_if(
                     pool,
                     store,
@@ -647,12 +691,11 @@ impl ResetManager {
     }
 
     /// @cc [owner:ghuntley,label:pool] manual-reset-operator-guarded
-    /// `manual_reset` MUST redeem at most one credit per call and only for the named account,
-    /// regardless of `auto_codex_resets`. It MUST refuse without consuming when upstream reports
-    /// ordinary usage allowed, or when a completed redemption for this outage has not yet restored
-    /// usage, unless `force` is set. It MUST persist the chosen credit and idempotency key before
-    /// consuming, MUST reuse a pending attempt's key on retry, and MUST readmit the account only
-    /// after upstream confirms usage is allowed.
+    /// `manual_reset` MUST redeem at most one credit per call for the named account, regardless of `auto_codex_resets`.
+    /// Without `force`, it MUST refuse when included or credit-backed usage is available.
+    /// It MUST also refuse a completed redemption whose outage continues, unless `force` is set.
+    /// It MUST persist the credit and idempotency key before consumption and reuse a pending attempt's key.
+    /// It MUST readmit the account only when upstream confirms included or credit-backed access.
     pub async fn manual_reset(
         &self,
         account: &Account,
@@ -671,7 +714,7 @@ impl ResetManager {
             ManualResetError::Upstream(reason)
         };
         let usage = self.fetch_usage(account, tokens).await.map_err(upstream)?;
-        if usage.rate_limit.as_ref().and_then(|r| r.allowed) == Some(true) {
+        if usage.allows_usage() {
             set_status_if(
                 pool,
                 store,
@@ -767,8 +810,8 @@ impl ResetManager {
         })
     }
 
-    /// Re-read usage a few times after a redemption and readmit the account once upstream
-    /// explicitly allows ordinary usage. Returns whether the account was readmitted.
+    /// Read usage after redemption and readmit the account when upstream allows included or credit-backed access.
+    /// Return whether the account was readmitted.
     async fn readmit_if_allowed(
         &self,
         account: &Account,
@@ -778,7 +821,7 @@ impl ResetManager {
     ) -> bool {
         for _ in 0..3 {
             if let Ok(usage) = self.fetch_usage(account, tokens).await
-                && usage.rate_limit.as_ref().and_then(|r| r.allowed) == Some(true)
+                && usage.allows_usage()
             {
                 set_status_if(
                     pool,
@@ -856,6 +899,9 @@ mod tests {
     struct MockState {
         allowed: AtomicBool,
         has_credit: AtomicBool,
+        usage_credits: Mutex<Option<serde_json::Value>>,
+        spend_control: Mutex<Option<serde_json::Value>>,
+        credit_access_after_reset: AtomicBool,
         fail_once: AtomicBool,
         consumes: AtomicUsize,
         redemption_ids: Mutex<Vec<String>>,
@@ -871,6 +917,8 @@ mod tests {
                 "primary_window": {"used_percent": if allowed { 0 } else { 100 }, "reset_at": now_ms() / 1000 + 3600, "limit_window_seconds": 18000},
                 "secondary_window": {"used_percent": if allowed { 0 } else { 100 }, "reset_at": now_ms() / 1000 + 6 * 86400, "limit_window_seconds": 604800}
             },
+            "credits": state.usage_credits.lock().unwrap().clone(),
+            "spend_control": state.spend_control.lock().unwrap().clone(),
             "rate_limit_reset_credits": {"available_count": if allowed || !state.has_credit.load(Ordering::SeqCst) { 0 } else { 1 }}
         }))
     }
@@ -911,7 +959,15 @@ mod tests {
                 Json(serde_json::json!({"error": "temporary"})),
             );
         }
-        state.allowed.store(true, Ordering::SeqCst);
+        if state.credit_access_after_reset.load(Ordering::SeqCst) {
+            *state.usage_credits.lock().unwrap() = Some(serde_json::json!({
+                "has_credits": true,
+                "unlimited": false,
+                "overage_limit_reached": false
+            }));
+        } else {
+            state.allowed.store(true, Ordering::SeqCst);
+        }
         (
             axum::http::StatusCode::OK,
             Json(serde_json::json!({"code": "reset", "windows_reset": 2})),
@@ -956,6 +1012,102 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn credit_usage_poll_respects_allowance_and_spend_limits() {
+        use serde_json::json;
+
+        let cases = [
+            (
+                "credit_balance",
+                json!({"has_credits": true, "unlimited": false, "overage_limit_reached": false}),
+                json!({"reached": false}),
+                false,
+                true,
+            ),
+            (
+                "unlimited_credits",
+                json!({"has_credits": false, "unlimited": true}),
+                json!(null),
+                false,
+                true,
+            ),
+            (
+                "overage_limit",
+                json!({"has_credits": true, "overage_limit_reached": true}),
+                json!(null),
+                false,
+                false,
+            ),
+            (
+                "spend_limit",
+                json!({"has_credits": true, "overage_limit_reached": false}),
+                json!({"reached": true}),
+                false,
+                false,
+            ),
+            (
+                "empty_credit_balance",
+                json!({"has_credits": false, "unlimited": false}),
+                json!(null),
+                false,
+                false,
+            ),
+            (
+                "missing_credit_access",
+                json!({"balance": "100"}),
+                json!(null),
+                false,
+                false,
+            ),
+            ("missing_credits", json!(null), json!(null), false, false),
+            (
+                "included_allowance",
+                json!({"has_credits": true, "overage_limit_reached": true}),
+                json!({"reached": true}),
+                true,
+                true,
+            ),
+        ];
+        for (name, usage_credits, spend_control, included_allowed, usable) in cases {
+            for initial_status in [AccountStatus::Healthy, AccountStatus::Cooling] {
+                let mock = Arc::new(MockState::default());
+                mock.allowed.store(included_allowed, Ordering::SeqCst);
+                *mock.usage_credits.lock().unwrap() = Some(usage_credits.clone());
+                *mock.spend_control.lock().unwrap() = Some(spend_control.clone());
+                let (base, server) = mock_server(mock).await;
+                let store = Arc::new(Store::in_memory().unwrap());
+                let mut account = cooling_account("account-1");
+                account.status = initial_status;
+                if initial_status == AccountStatus::Healthy {
+                    account.reset_at = 0;
+                }
+                store.upsert_account(&account);
+                let pool = Arc::new(Mutex::new(PoolCore::new(&store, test_surfaces())));
+                let client = reqwest::Client::new();
+                let tokens = TokenManager::new(store.clone(), client.clone());
+                let manager = ResetManager::new(client, base, false);
+
+                manager.poll_account(&account, &tokens, &pool, &store).await;
+
+                let expected = if usable {
+                    AccountStatus::Healthy
+                } else {
+                    AccountStatus::Cooling
+                };
+                let persisted = store.get_account(&account.id).unwrap();
+                assert_eq!(persisted.status, expected, "{name}: {initial_status:?}");
+                let core = pool.lock().unwrap();
+                let current = core.account(&account.id).unwrap();
+                assert_eq!(current.status, expected, "{name}: {initial_status:?}");
+                assert_eq!(current.reset_at, persisted.reset_at);
+                if usable {
+                    assert_eq!(persisted.reset_at, 0, "{name}: {initial_status:?}");
+                }
+                server.abort();
+            }
+        }
+    }
+
     fn cooling_account(id: &str) -> Account {
         Account {
             id: id.into(),
@@ -988,6 +1140,129 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         (base, tokio::spawn(axum::serve(listener, app).into_future()))
+    }
+
+    #[tokio::test]
+    async fn credit_usage_preserves_disabled_and_auth_error_accounts() {
+        for status in [AccountStatus::Disabled, AccountStatus::AuthError] {
+            let mock = Arc::new(MockState::default());
+            *mock.usage_credits.lock().unwrap() = Some(serde_json::json!({"has_credits": true}));
+            let (base, server) = mock_server(mock).await;
+            let store = Arc::new(Store::in_memory().unwrap());
+            let mut account = cooling_account("account-1");
+            account.status = status;
+            store.upsert_account(&account);
+            let pool = Arc::new(Mutex::new(PoolCore::new(&store, test_surfaces())));
+            let client = reqwest::Client::new();
+            let tokens = TokenManager::new(store.clone(), client.clone());
+            let manager = ResetManager::new(client, base, false);
+
+            manager.poll_account(&account, &tokens, &pool, &store).await;
+
+            assert_eq!(store.get_account(&account.id).unwrap().status, status);
+            assert_eq!(
+                pool.lock().unwrap().account(&account.id).unwrap().status,
+                status
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn credit_usage_recovers_without_an_automatic_reset() {
+        let mock = Arc::new(MockState::default());
+        mock.has_credit.store(true, Ordering::SeqCst);
+        *mock.usage_credits.lock().unwrap() = Some(serde_json::json!({"has_credits": true}));
+        let (base, server) = mock_server(mock.clone()).await;
+        let store = Arc::new(Store::in_memory().unwrap());
+        let account = cooling_account("account-1");
+        store.upsert_account(&account);
+        store.save_reset_attempt(&account.id, "credit-1", "pending-redemption");
+        let pool = Arc::new(Mutex::new(PoolCore::new(&store, test_surfaces())));
+        let client = reqwest::Client::new();
+        let tokens = TokenManager::new(store.clone(), client.clone());
+        let manager = ResetManager::new(client, base, true);
+
+        assert!(
+            manager
+                .maybe_reset(&pool, &store, &tokens, "credit-request")
+                .await
+        );
+        assert_eq!(mock.consumes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store.get_account(&account.id).unwrap().status,
+            AccountStatus::Healthy
+        );
+        assert_eq!(
+            pool.lock().unwrap().account(&account.id).unwrap().status,
+            AccountStatus::Healthy
+        );
+        assert!(store.reset_attempt(&account.id).is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn manual_reset_refuses_credit_backed_usage() {
+        let mock = Arc::new(MockState::default());
+        mock.has_credit.store(true, Ordering::SeqCst);
+        *mock.usage_credits.lock().unwrap() = Some(serde_json::json!({"has_credits": true}));
+        let (base, server) = mock_server(mock.clone()).await;
+        let store = Arc::new(Store::in_memory().unwrap());
+        let account = cooling_account("account-1");
+        store.upsert_account(&account);
+        let pool = Arc::new(Mutex::new(PoolCore::new(&store, test_surfaces())));
+        let client = reqwest::Client::new();
+        let tokens = TokenManager::new(store.clone(), client.clone());
+        let manager = ResetManager::new(client, base, false);
+
+        assert_eq!(
+            manager
+                .manual_reset(&account, &tokens, &pool, &store, false)
+                .await
+                .unwrap_err(),
+            ManualResetError::NotRateLimited
+        );
+        assert_eq!(mock.consumes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store.get_account(&account.id).unwrap().status,
+            AccountStatus::Healthy
+        );
+        assert_eq!(
+            pool.lock().unwrap().account(&account.id).unwrap().status,
+            AccountStatus::Healthy
+        );
+        assert!(store.reset_attempt(&account.id).is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reset_readmits_when_credit_access_precedes_included_quota_recovery() {
+        let mock = Arc::new(MockState::default());
+        mock.has_credit.store(true, Ordering::SeqCst);
+        mock.credit_access_after_reset.store(true, Ordering::SeqCst);
+        let (base, server) = mock_server(mock.clone()).await;
+        let store = Arc::new(Store::in_memory().unwrap());
+        let account = cooling_account("account-1");
+        store.upsert_account(&account);
+        let pool = Arc::new(Mutex::new(PoolCore::new(&store, test_surfaces())));
+        let client = reqwest::Client::new();
+        let tokens = TokenManager::new(store.clone(), client.clone());
+        let manager = ResetManager::new(client, base, false);
+
+        let outcome = manager
+            .manual_reset(&account, &tokens, &pool, &store, false)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.outcome, "reset");
+        assert_eq!(outcome.status, AccountStatus::Healthy);
+        assert_eq!(mock.consumes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.get_account(&account.id).unwrap().status,
+            AccountStatus::Healthy
+        );
+        assert!(store.reset_attempt(&account.id).is_none());
+        server.abort();
     }
 
     #[tokio::test]

@@ -944,6 +944,8 @@ mod tests {
                         limit_window_seconds: None,
                     }),
                 }),
+                credits: None,
+                spend_control: None,
                 available_resets: 0,
                 credit_expirations: vec![],
                 fetched_at_ms: 1_000,

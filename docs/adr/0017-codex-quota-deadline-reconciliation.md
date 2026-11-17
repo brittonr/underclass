@@ -19,11 +19,17 @@ deadline from `error.resets_at` (Unix seconds) and Retry-After; use the configur
 neither gives a future deadline. Treat overload as transient. Other backends retain the generic
 status and Retry-After classification.
 
-The account-matched Codex usage poll can move a healthy account into cooling when it reports a
-blocked, exhausted quota window. It can extend a cooling deadline to a later verified natural
-recovery, but cannot shorten one. An explicit `allowed: true` readmits a cooling account. Missing
-or failed usage results leave health untouched. Persist each health transition immediately. The
-scope is the ordinary account-wide usage limit; model-specific limits need separate routing data.
+An account-matched Codex usage poll can cool an account only when its included allowance is exhausted and credit-backed usage is unavailable.
+Available included usage takes precedence over credit or spend limits.
+Credit-backed usage needs `credits.has_credits: true` or `credits.unlimited: true`, without an explicit `credits.overage_limit_reached: true` or `spend_control.reached: true` block.
+
+Missing credit metadata does not grant access.
+Either form of usable access readmits a cooling account and clears its reset attempt.
+Otherwise, an exhausted window can extend a cooling deadline, but cannot shorten one.
+
+Failed or missing usage responses leave health unchanged.
+Persist each health transition immediately.
+Model-specific limits remain separate.
 
 ## Consequences
 
